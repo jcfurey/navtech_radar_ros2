@@ -6,9 +6,9 @@ Dataset.
 
 ## Status
 
-This repository currently pins the Navtech IASDK and records the driver/API
-design. The ROS interfaces and live transport node have not been implemented
-yet.
+This repository pins the Navtech IASDK and implements the lossless ROS API,
+legacy bag playback transport, and sweep assembly. A live IASDK transport node
+has not been implemented yet.
 
 The intended boundary is:
 
@@ -21,6 +21,26 @@ The intended boundary is:
 
 See [docs/driver_design.md](docs/driver_design.md) for the research findings,
 proposed messages, QoS, and implementation sequence.
+
+## Bag playback
+
+`navtech_radar_driver/legacy_bag_driver` adapts the dataset's ROS 1-derived
+topics without changing the source bag:
+
+```text
+/Navtech/Configuration_Topic -> /navtech_radar/configuration
+/Navtech/FFTData             -> /navtech_radar/fft/spoke
+```
+
+`navtech_radar_processing/fft_sweep_assembler` then publishes:
+
+```text
+/navtech_radar/fft/sweep     navtech_radar_msgs/FftSweep
+/navtech_radar/fft/image     sensor_msgs/Image (mono16)
+/navtech_radar/point_cloud   sensor_msgs/PointCloud2 (optional, lossy)
+```
+
+The TAMU workspace's `view_bag.sh` launches this pipeline automatically.
 
 ## SDK submodule
 
@@ -54,17 +74,14 @@ git -C vendor/iasdk-public status --short
 Any SDK change should be made in a reachable fork/commit and then update the
 gitlink; local uncommitted SDK patches must not become driver dependencies.
 
-## Planned repository layout
+## Repository layout
 
 ```text
 navtech_radar_ros2/
 ├── docs/
-├── navtech_radar_driver/       # lifecycle/composable transport node
+├── navtech_radar_driver/       # transport nodes and legacy bag adapter
 ├── navtech_radar_msgs/         # configuration, spoke, and sweep interfaces
 ├── navtech_radar_processing/   # optional sweep/projection/CFAR components
 └── vendor/
     └── iasdk-public/           # pinned upstream submodule
 ```
-
-The package directories will be introduced as their public contracts are
-implemented and tested against the TAMU bag.

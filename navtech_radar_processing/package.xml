@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>navtech_radar_processing</name>
+  <version>0.1.0</version>
+  <description>Lossless sweep assembly and optional Navtech radar products.</description>
+  <maintainer email="jcfurey@users.noreply.github.com">jcfurey</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>navtech_radar_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

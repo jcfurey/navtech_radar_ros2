@@ -87,7 +87,7 @@ or calibration package owns that transform.
 ## Proposed message semantics
 
 The canonical output should be one lossless spoke message per radar packet.
-Names are illustrative until the new interface package is created.
+These names are implemented in `navtech_radar_msgs`.
 
 ```text
 # RadarConfiguration.msg
@@ -182,8 +182,9 @@ consumer begin from the same unchanged `uint16` FFT values.
 
 1. Pin a specific canonical IASDK commit and document its MIT attribution.
 2. Create `navtech_radar_msgs` and adapt this bag's legacy
-   `HighPrecisionFFTData` into the proposed spoke message.
+   `HighPrecisionFFTData` into the proposed spoke message. (Implemented.)
 3. Validate sweep assembly, timestamps, and drop detection against this bag.
+   (Implemented for playback; hardware packet fixtures remain.)
 4. Add the live Colossus transport node when CTS350-X hardware is available.
 5. Add Cartesian projection and CFAR only after the raw contract is stable.
 
