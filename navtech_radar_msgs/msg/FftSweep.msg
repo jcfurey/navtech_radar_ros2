@@ -10,7 +10,10 @@ uint8 sample_bit_depth
 float64 range_resolution
 
 # mono16 for a high-precision stream. Rows are increasing encoder azimuth and
-# columns are range bins.
+# columns are range bins. Duplicate encoder rows are retained in arrival order;
+# missing rows are omitted, not zero-filled. Partial sweeps can have fewer or
+# more rows than the configured azimuth_samples. All rows have the same width,
+# frame, sample_bit_depth, and configuration_version.
 sensor_msgs/Image image
 
 # One entry per image row.

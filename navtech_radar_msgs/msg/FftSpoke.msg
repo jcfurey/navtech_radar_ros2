@@ -6,16 +6,19 @@ std_msgs/Header header
 # Local receipt time. During bag adaptation this is simulated delivery time.
 builtin_interfaces/Time host_stamp
 
+# Zero means no configuration was available at receipt time.
 uint32 configuration_version
 
 # Original Colossus timestamp fields. Legacy bags expose the converted values
-# through header.stamp, so the adapter reconstructs these fields from it.
+# through header.stamp. The legacy adapter copies seconds and nanoseconds;
+# it cannot recover original wire bytes or a different firmware time encoding.
 uint32 ntp_seconds
 uint32 ntp_split_seconds
 
 uint16 sweep_counter
 
-# Raw encoder count and derived angle in radians. No mount offset is applied.
+# Raw encoder count and derived angle in radians, normalized to [0, 2*pi).
+# No mount offset is applied.
 uint16 azimuth
 float64 azimuth_angle
 

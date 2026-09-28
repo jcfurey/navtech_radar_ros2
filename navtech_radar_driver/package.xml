@@ -11,7 +11,12 @@
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>nav_ross</exec_depend>
   <exec_depend>navtech_radar_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>rclpy</exec_depend>
+
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>ament_cmake_ros</test_depend>
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

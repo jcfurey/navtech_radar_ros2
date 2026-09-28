@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """Assemble lossless Navtech FFT spokes into metadata-rich revolutions."""
 
+from array import array
 from dataclasses import dataclass
 import math
 
-import numpy as np
-import rclpy
 from navtech_radar_msgs.msg import FftSpoke, FftSweep, RadarConfiguration
+import numpy as np
+from rcl_interfaces.msg import ParameterDescriptor
+import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy
 from rclpy.qos import HistoryPolicy
+from rclpy.qos import qos_profile_sensor_data
 from rclpy.qos import QoSProfile
 from rclpy.qos import ReliabilityPolicy
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2, PointField
 
 
 @dataclass
 class StoredSpoke:
-    arrival_index: int
     angle: float
     azimuth: int
     sweep_counter: int
@@ -26,36 +28,42 @@ class StoredSpoke:
     sample_bit_depth: int
     stamp: object
     host_stamp: object
+    frame_id: str
     values: np.ndarray
-    points: np.ndarray | None
 
 
 class FftSweepAssembler(Node):
     """Create sweep and visualization products from canonical FFT spokes."""
 
-    def __init__(self) -> None:
-        super().__init__('navtech_fft_sweep_assembler')
+    def __init__(self, **kwargs) -> None:
+        super().__init__('navtech_fft_sweep_assembler', **kwargs)
 
-        self.declare_parameter(
-            'configuration_topic', '/navtech_radar/configuration'
-        )
-        self.declare_parameter('spoke_topic', '/navtech_radar/fft/spoke')
-        self.declare_parameter('sweep_topic', '/navtech_radar/fft/sweep')
-        self.declare_parameter('image_topic', '/navtech_radar/fft/image')
-        self.declare_parameter('point_cloud_topic', '/navtech_radar/point_cloud')
-        self.declare_parameter('output_frame', 'navtech')
-        self.declare_parameter('range_resolution', 0.0438)
-        self.declare_parameter('expected_spokes', 400)
-        self.declare_parameter('publish_partial_sweeps', True)
-        self.declare_parameter('minimum_spokes', 2)
-        self.declare_parameter('publish_point_cloud', False)
-        self.declare_parameter('min_range', 2.0)
-        self.declare_parameter('max_range', 200.0)
-        self.declare_parameter('intensity_threshold', 22000)
-        self.declare_parameter('max_points_per_spoke', 48)
-        self.declare_parameter('azimuth_offset_degrees', 0.0)
-        self.declare_parameter('wrap_threshold_degrees', 180.0)
-        self.declare_parameter('input_queue_depth', 512)
+        defaults = {
+            'configuration_topic': 'navtech_radar/configuration',
+            'spoke_topic': 'navtech_radar/fft/spoke',
+            'sweep_topic': 'navtech_radar/fft/sweep',
+            'image_topic': 'navtech_radar/fft/image',
+            'point_cloud_topic': 'navtech_radar/point_cloud',
+            'output_frame': '',
+            'range_resolution': 0.0438,
+            'expected_spokes': 400,
+            'publish_partial_sweeps': True,
+            'minimum_spokes': 2,
+            'publish_point_cloud': False,
+            'min_range': 2.0,
+            'max_range': 200.0,
+            'intensity_threshold': 22000,
+            'max_points_per_spoke': 48,
+            'azimuth_offset_degrees': 0.0,
+            'wrap_threshold_degrees': 180.0,
+            'input_queue_depth': 512,
+            'max_buffered_spokes': 2048,
+            'max_range_bins': 16384,
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(
+                name, value, ParameterDescriptor(read_only=True)
+            )
 
         self._output_frame = str(self.get_parameter('output_frame').value)
         self._range_resolution = float(
@@ -83,13 +91,23 @@ class FftSweepAssembler(Node):
         self._wrap_threshold = math.radians(
             float(self.get_parameter('wrap_threshold_degrees').value)
         )
+        self._max_buffered_spokes = int(
+            self.get_parameter('max_buffered_spokes').value
+        )
+        self._max_range_bins = int(self.get_parameter('max_range_bins').value)
+        self._validate_parameters()
 
         self._configuration_version = 0
+        self._configuration_key = None
+        self._range_bins = None
+        self._encoder_size = None
+        self._sample_bit_depth = None
+        self._configuration_frame = None
         self._last_angle = None
         self._spokes: list[StoredSpoke] = []
-        self._arrival_index = 0
         self._sweep_sequence = 0
         self._dropped_sweeps = 0
+        self._invalid_spokes = 0
 
         configuration_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -138,19 +156,68 @@ class FftSweepAssembler(Node):
             spoke_qos,
         )
 
+    def _validate_parameters(self) -> None:
+        for name in (
+            'range_resolution', 'min_range', 'max_range',
+            'azimuth_offset_degrees', 'wrap_threshold_degrees',
+        ):
+            if not math.isfinite(self.get_parameter(name).value):
+                raise ValueError(f'{name} must be finite')
+        if self._range_resolution <= 0:
+            raise ValueError('range_resolution must be positive')
+        if not 0 <= self._min_range < self._max_range:
+            raise ValueError('ranges must satisfy 0 <= min_range < max_range')
+        if not 0 <= self._threshold <= 65535 or self._max_points < 0:
+            raise ValueError('invalid intensity_threshold or max_points_per_spoke')
+        if not 0 < self._wrap_threshold < 2 * math.pi:
+            raise ValueError('wrap_threshold_degrees must be between 0 and 360')
+        if not 1 <= self._minimum_spokes <= self._expected_spokes <= 65535:
+            raise ValueError('require 1 <= minimum_spokes <= expected_spokes <= 65535')
+        if self._max_buffered_spokes < self._expected_spokes:
+            raise ValueError('max_buffered_spokes must be at least expected_spokes')
+        if not 1 <= self._max_range_bins <= 65535:
+            raise ValueError('max_range_bins must be between 1 and 65535')
+        if self.get_parameter('input_queue_depth').value <= 0:
+            raise ValueError('input_queue_depth must be positive')
+        if self._output_frame.startswith('/'):
+            raise ValueError('output_frame must have no leading slash')
+
     def _configuration_callback(self, message: RadarConfiguration) -> None:
         if (
-            self._spokes
-            and self._configuration_version
-            and message.configuration_version != self._configuration_version
+            not math.isfinite(message.range_resolution)
+            or message.range_resolution <= 0
+            or not 0 < message.azimuth_samples <= message.encoder_size
+            or message.azimuth_samples > self._max_buffered_spokes
+            or not 0 < message.range_bins <= self._max_range_bins
+            or message.sample_bit_depth not in (8, 16)
+            or message.configuration_version == 0
+            or not message.header.frame_id
+            or message.header.frame_id.startswith('/')
+            or (self._output_frame and message.header.frame_id != self._output_frame)
         ):
-            self._finish_sweep()
+            self.get_logger().warning(
+                'Ignoring invalid or incompatible radar configuration',
+                throttle_duration_sec=5.0,
+            )
+            return
+        key = (
+            message.configuration_version, message.range_resolution,
+            message.azimuth_samples, message.encoder_size, message.range_bins,
+            message.sample_bit_depth, message.header.frame_id,
+        )
+        if key == self._configuration_key:
+            return
+        # Flush with the old geometry, including the version-zero fallback.
+        self._finish_sweep()
+        self._configuration_key = key
 
         self._configuration_version = int(message.configuration_version)
-        if math.isfinite(message.range_resolution) and message.range_resolution > 0:
-            self._range_resolution = float(message.range_resolution)
-        if message.azimuth_samples > 0:
-            self._expected_spokes = int(message.azimuth_samples)
+        self._range_resolution = float(message.range_resolution)
+        self._expected_spokes = int(message.azimuth_samples)
+        self._range_bins = int(message.range_bins)
+        self._encoder_size = int(message.encoder_size)
+        self._sample_bit_depth = int(message.sample_bit_depth)
+        self._configuration_frame = message.header.frame_id
 
         self.get_logger().info(
             f'Using configuration version {self._configuration_version}: '
@@ -160,22 +227,66 @@ class FftSweepAssembler(Node):
 
     def _spoke_callback(self, message: FftSpoke) -> None:
         angle = float(message.azimuth_angle)
-        if not math.isfinite(angle) or not message.data:
+        if (
+            not math.isfinite(angle)
+            or not 0 < len(message.data) <= self._max_range_bins
+            or message.sample_bit_depth not in (8, 16)
+            or message.header.stamp.nanosec >= 1_000_000_000
+            or message.host_stamp.nanosec >= 1_000_000_000
+            or not message.header.frame_id or message.header.frame_id.startswith('/')
+            or (self._output_frame and message.header.frame_id != self._output_frame)
+        ):
+            self._reject_spoke('Invalid FFT payload, timestamp, angle or frame')
+            return
+        # DDS does not order deliveries across configuration and spoke topics.
+        # Never label data using geometry belonging to another version.
+        if message.configuration_version != self._configuration_version:
+            self._reject_spoke('FFT configuration version is not available')
+            return
+        if self._configuration_key is not None and (
+            len(message.data) != self._range_bins
+            or message.azimuth >= self._encoder_size
+            or message.sample_bit_depth != self._sample_bit_depth
+            or message.header.frame_id != self._configuration_frame
+        ):
+            self._reject_spoke('FFT spoke does not match its configuration')
             return
 
+        # Validate before changing assembly state. ROS uint16 sequences own
+        # their buffers; the view keeps the payload alive without a copy.
+        values = np.asarray(message.data, dtype=np.uint16)
+        if message.sample_bit_depth == 8 and np.any(values > 255):
+            self._reject_spoke('8-bit FFT spoke contains values above 255')
+            return
+        values.setflags(write=False)
+
+        angle %= 2 * math.pi
+        if self._spokes:
+            previous = self._spokes[-1]
+            stamp_key = (message.header.stamp.sec, message.header.stamp.nanosec)
+            if stamp_key < (previous.stamp.sec, previous.stamp.nanosec):
+                # Seeking/looping a bag or a sensor clock reset ends this epoch.
+                self._reset_sweep()
+            elif (
+                len(message.data) != previous.values.size
+                or message.sample_bit_depth != previous.sample_bit_depth
+                or message.header.frame_id != previous.frame_id
+            ):
+                self._finish_sweep()
         if (
             self._last_angle is not None
             and angle < self._last_angle - self._wrap_threshold
         ):
             self._finish_sweep()
 
-        values = np.asarray(message.data, dtype=np.uint16).copy()
-        points = None
-        if self._publish_point_cloud:
-            points = self._extract_spoke_points(values, angle)
+        if len(self._spokes) >= self._max_buffered_spokes:
+            self.get_logger().warning(
+                'Sweep buffer limit reached without an azimuth wrap; resetting',
+                throttle_duration_sec=5.0,
+            )
+            self._reset_sweep()
 
         self._spokes.append(StoredSpoke(
-            arrival_index=self._arrival_index,
             angle=angle,
             azimuth=int(message.azimuth),
             sweep_counter=int(message.sweep_counter),
@@ -183,15 +294,27 @@ class FftSweepAssembler(Node):
             sample_bit_depth=int(message.sample_bit_depth),
             stamp=message.header.stamp,
             host_stamp=message.host_stamp,
+            frame_id=message.header.frame_id,
             values=values,
-            points=points,
         ))
-        self._arrival_index += 1
         self._last_angle = angle
+
+    def _reject_spoke(self, reason: str) -> None:
+        self._invalid_spokes += 1
+        self.get_logger().warning(reason, throttle_duration_sec=5.0)
+
+    def _reset_sweep(self) -> None:
+        if self._spokes:
+            self._dropped_sweeps += 1
+        self._spokes = []
+        self._last_angle = None
 
     def _finish_sweep(self) -> None:
         spokes = self._spokes
         self._spokes = []
+        self._last_angle = None
+        if not spokes:
+            return
         if len(spokes) < self._minimum_spokes:
             self._dropped_sweeps += 1
             return
@@ -199,44 +322,36 @@ class FftSweepAssembler(Node):
         unique_azimuths = len({spoke.azimuth for spoke in spokes})
         missing_spokes = max(0, self._expected_spokes - unique_azimuths)
         duplicate_spokes = len(spokes) - unique_azimuths
-        complete = missing_spokes == 0 and duplicate_spokes == 0
+        complete = unique_azimuths == self._expected_spokes and duplicate_spokes == 0
         if not complete and not self._publish_partial:
             self._dropped_sweeps += 1
             return
 
-        ordered = sorted(
-            spokes,
-            key=lambda spoke: (spoke.angle, spoke.arrival_index),
-        )
-        width = min(spoke.values.size for spoke in ordered)
-        if width == 0:
-            self._dropped_sweeps += 1
-            return
+        # Stable sorting preserves duplicate encoder rows and their metadata.
+        ordered = sorted(spokes, key=lambda spoke: spoke.azimuth)
+        width = ordered[0].values.size
 
         pixels = np.empty((len(ordered), width), dtype='<u2')
         for row, spoke in enumerate(ordered):
-            pixels[row, :] = spoke.values[:width]
+            pixels[row, :] = spoke.values
 
         image = Image()
         image.header.stamp = spokes[0].stamp
-        image.header.frame_id = self._output_frame
+        image.header.frame_id = spokes[0].frame_id
         image.height = pixels.shape[0]
         image.width = pixels.shape[1]
         image.encoding = 'mono16'
         image.is_bigendian = False
         image.step = image.width * 2
-        image.data = pixels.tobytes()
+        image.data = array('B')
+        image.data.frombytes(memoryview(pixels).cast('B'))
 
         sweep = FftSweep()
         sweep.header = image.header
         sweep.end_stamp = spokes[-1].stamp
-        sweep.configuration_version = max(
-            spoke.configuration_version for spoke in ordered
-        )
+        sweep.configuration_version = spokes[0].configuration_version
         sweep.sweep_sequence = self._sweep_sequence
-        sweep.sample_bit_depth = max(
-            spoke.sample_bit_depth for spoke in ordered
-        )
+        sweep.sample_bit_depth = spokes[0].sample_bit_depth
         sweep.range_resolution = self._range_resolution
         sweep.image = image
         sweep.encoder_values = [spoke.azimuth for spoke in ordered]
@@ -246,9 +361,9 @@ class FftSweepAssembler(Node):
 
         self._sweep_publisher.publish(sweep)
         self._image_publisher.publish(image)
-        point_count = self._publish_cloud(spokes[-1].stamp, ordered)
+        point_count = self._publish_cloud(image.header, ordered)
 
-        self._sweep_sequence += 1
+        self._sweep_sequence = (self._sweep_sequence + 1) % (1 << 32)
         if self._sweep_sequence == 1 or self._sweep_sequence % 40 == 0:
             self.get_logger().info(
                 f'Published sweep {self._sweep_sequence - 1}: '
@@ -299,20 +414,19 @@ class FftSweepAssembler(Node):
         points[:, 3] = values[bins]
         return points
 
-    def _publish_cloud(self, stamp, spokes: list[StoredSpoke]) -> int:
+    def _publish_cloud(self, header, spokes: list[StoredSpoke]) -> int:
         if not self._publish_point_cloud:
             return 0
 
-        spoke_points = [
-            spoke.points for spoke in spokes if spoke.points is not None
-        ]
-        if not spoke_points:
-            return 0
-
-        points = np.concatenate(spoke_points)
+        # Do projection only for sweeps that pass the publication policy.
+        spoke_points = [self._extract_spoke_points(s.values, s.angle) for s in spokes]
+        spoke_points = [points for points in spoke_points if points is not None]
+        points = (
+            np.concatenate(spoke_points) if spoke_points
+            else np.empty((0, 4), dtype='<f4')
+        )
         cloud = PointCloud2()
-        cloud.header.stamp = stamp
-        cloud.header.frame_id = self._output_frame
+        cloud.header = header
         cloud.height = 1
         cloud.width = int(points.shape[0])
         cloud.fields = [
@@ -329,7 +443,10 @@ class FftSweepAssembler(Node):
         cloud.is_bigendian = False
         cloud.point_step = 16
         cloud.row_step = cloud.point_step * cloud.width
-        cloud.data = points.astype('<f4', copy=False).tobytes()
+        cloud.data = array('B')
+        cloud.data.frombytes(
+            memoryview(points.astype('<f4', copy=False).reshape(-1)).cast('B')
+        )
         cloud.is_dense = True
         self._point_cloud_publisher.publish(cloud)
         return cloud.width
@@ -337,13 +454,15 @@ class FftSweepAssembler(Node):
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = FftSweepAssembler()
+    node = None
     try:
+        node = FftSweepAssembler()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

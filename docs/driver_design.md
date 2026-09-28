@@ -147,13 +147,16 @@ values.
 
 ## Topics and QoS
 
-Recommended relative topic names:
+Current relative topic defaults (the topic parameters and ROS remapping can
+override these):
 
-- `~/configuration`: reliable, transient local, keep last 1; publish only when
+- `navtech_radar/configuration`: reliable, transient local, keep last 1; publish only when
   the configuration changes.
-- `~/fft/spoke`: sensor-data QoS, bounded queue; the lossless canonical stream.
-- `~/fft/sweep`: sensor-data QoS, depth 2; optional assembled output.
-- `~/diagnostics`: standard ROS diagnostics for connection and packet health.
+- `navtech_radar/fft/spoke`: sensor-data QoS, bounded queue; the lossless canonical stream.
+- `navtech_radar/fft/sweep`: reliable, volatile, depth 2; optional assembled output.
+- `navtech_radar/fft/image`: reliable, volatile, depth 2; the sweep image alone.
+- `navtech_radar/point_cloud`: sensor-data QoS; optional lossy peak selection.
+- `diagnostics`: standard ROS diagnostics for connection and packet health.
 
 The node should expose configurable topic/frame names rather than retaining
 the legacy uppercase global names.
