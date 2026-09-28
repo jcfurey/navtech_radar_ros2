@@ -9,6 +9,12 @@ install(PROGRAMS
   RENAME fft_sweep_assembler
 )
 
+install(PROGRAMS
+  scripts/fft_sweep_visualizer.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME fft_sweep_visualizer
+)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_ros REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)

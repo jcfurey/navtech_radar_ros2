@@ -42,6 +42,44 @@ topics without changing the source bag:
 
 The TAMU workspace's `view_bag.sh` launches this pipeline automatically.
 
+## Enhanced images
+
+`navtech_radar_processing/fft_sweep_visualizer` optionally consumes the sweep
+and its configuration and publishes two `bgr8` display images:
+
+- `navtech_radar/fft/display`: cropped, labeled range–azimuth image.
+- `navtech_radar/fft/cartesian`: top-down radar image with range rings, +x up
+  and +y left. It uses encoder angles in the radar frame; it does not apply TF,
+  a mount offset, or the point-cloud visualization's azimuth offset.
+
+The default display range is 2–150 m. Range columns are reduced to at most
+1000 using maximum pooling, preserving narrow peaks. Encoder values place rows
+on the configured azimuth grid; duplicate rows combine by maximum for display,
+and missing rows remain black. Smoothed 50th/99.7th percentile contrast and an
+Inferno color scale make returns easier to see than full-range linear grayscale.
+The color scale shows raw FFT levels, not calibrated power or height. Contrast
+history resets when configuration changes or timestamps move backward.
+
+These are lossy visualization products. `FftSweep`, `FftSpoke`, and the original
+`mono16` image are unmodified. The radar cloud stays planar because the source
+contains no elevation measurement. The visualizer requires a matching nonzero
+configuration version and supports up to 2048 azimuth rows and 16384 range bins.
+Image publishers and the sweep subscription use reliable, volatile QoS, depth 1.
+Rendering is skipped when neither output has subscribers.
+
+```bash
+ros2 run navtech_radar_processing fft_sweep_visualizer --ros-args \
+  -p use_sim_time:=true -p max_range:=100.0 -p lower_percentile:=60.0
+```
+
+Other startup parameters include `min_range`, `image_width`, `cartesian_size`
+(800 by default), `upper_percentile`, `contrast_alpha` (0.2), `gamma` (1.0),
+and `annotate` (true). Gamma below 1 brightens weaker returns. The playback
+workspace starts this node and configures RViz automatically. Its
+`radar_images:=false` launch option returns to the raw image display.
+
+![Recorded FFT sweep before and after display processing](docs/fft_display_comparison.png)
+
 ## Runtime behavior
 
 Canonical topic defaults are relative (`navtech_radar/configuration`,
