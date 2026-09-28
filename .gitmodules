@@ -1,0 +1,7 @@
+[submodule "vendor/iasdk-public"]
+	path = vendor/iasdk-public
+	url = https://bitbucket.org/navtechradar/iasdk-public.git
+	shallow = true
+	# Upstream commit 62759ba has self-inconsistent line-ending attributes
+	# that mark five untouched files dirty immediately after Linux checkout.
+	ignore = dirty

@@ -1,0 +1,11 @@
+/build/
+/install/
+/log/
+
+.cache/
+.clangd/
+.vscode/
+compile_commands.json
+
+__pycache__/
+*.pyc
