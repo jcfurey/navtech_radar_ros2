@@ -48,6 +48,7 @@ def make_node(context):
         node._sweep_publisher = Recorder()
         node._image_publisher = Recorder()
         node._point_cloud_publisher = Recorder()
+        node._scan_publisher = Recorder()
         return node
 
     yield create
@@ -286,6 +287,147 @@ def test_peak_selection_cloud_bytes_and_empty_cloud(make_node):
     assert len(cloud.fields) == 4
 
 
+def test_cfar_adapts_to_clutter_and_preserves_source(make_node):
+    node = make_node(
+        peak_selection='cfar', cfar_training_cells=4, cfar_guard_cells=1,
+        cfar_threshold_offset=500.0, intensity_threshold=0,
+        min_peak_separation=0.0, min_range=0.0, max_range=100.0,
+        range_resolution=0.5,
+    )
+    values = np.full(80, 1000, dtype=np.uint16)
+    values[40:] = 20000
+    values[15], values[20], values[60], values[65] = 3000, 1100, 22000, 20100
+    original = values.copy()
+    # A hard clutter boundary also exceeds a cell-averaging threshold. This
+    # detector does not promise to distinguish that edge from a reflector.
+    np.testing.assert_array_equal(node._extract_peak_bins(values), [15, 40, 60])
+    np.testing.assert_array_equal(values, original)
+
+
+def test_cfar_matches_scalar_windows_without_uint16_overflow(make_node):
+    node = make_node(
+        peak_selection='cfar', cfar_training_cells=5, cfar_guard_cells=2,
+        cfar_threshold_offset=1000.0, intensity_threshold=0,
+        min_peak_separation=0.0, min_range=0.0, max_range=100.0,
+        range_resolution=0.5,
+    )
+    values = np.random.default_rng(12).integers(20000, 65536, 150, dtype=np.uint16)
+    expected = []
+    for i in range(7, len(values) - 7):
+        noise = np.concatenate((values[i - 7:i - 2], values[i + 3:i + 8])).mean()
+        if (values[i] > values[i - 1] and values[i] >= values[i + 1]
+                and values[i] > noise + 1000):
+            expected.append(i)
+    np.testing.assert_array_equal(node._extract_peak_bins(values), expected)
+
+
+def test_cfar_separation_selects_strongest_nearby_peak_and_ties_nearest(make_node):
+    node = make_node(
+        peak_selection='cfar', cfar_training_cells=2, cfar_guard_cells=4,
+        cfar_threshold_offset=100.0, intensity_threshold=0,
+        min_peak_separation=1.5, min_range=0.0, max_range=100.0,
+        range_resolution=0.5,
+    )
+    values = np.full(60, 1000, dtype=np.uint16)
+    values[10], values[12], values[30], values[32] = 3000, 5000, 4000, 4000
+    np.testing.assert_array_equal(node._extract_peak_bins(values), [12, 30])
+    # CFAR requires both complete training windows.
+    assert node._extract_peak_bins(np.array([0, 65535, 0], dtype=np.uint16)).size == 0
+
+
+@pytest.mark.parametrize('selection,expected', [('nearest', 0.5), ('strongest', 1.5)])
+def test_scan_one_return_and_cloud_multiple_returns_share_geometry(make_node, selection, expected):
+    node = make_node(
+        publish_scan=True, publish_point_cloud=True, scan_selection=selection,
+        range_resolution=0.5, expected_spokes=4, min_range=0.0,
+        max_range=3.0, intensity_threshold=100, max_points_per_spoke=0,
+        azimuth_offset_degrees=90.0,
+    )
+    sources = [spoke(a, values=[0, 150, 0, 200, 0]) for a in (0, 90, 180, 270)]
+    before = [serialize_message(s) for s in sources]
+    for source in sources:
+        node._spoke_callback(source)
+    node._finish_sweep()
+    scan = node._scan_publisher.messages[0]
+    cloud = node._point_cloud_publisher.messages[0]
+    np.testing.assert_allclose(scan.ranges, [expected] * 4)
+    assert scan.angle_min == pytest.approx(math.pi / 2)
+    assert scan.angle_increment == pytest.approx(math.pi / 2)
+    assert scan.angle_max == pytest.approx(2 * math.pi)
+    assert cloud.width == 8
+    points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
+    np.testing.assert_allclose(points[:2], [[0, 0.5, 0, 150], [0, 1.5, 0, 200]], atol=1e-6)
+    assert scan.header == cloud.header
+    assert [serialize_message(s) for s in sources] == before
+
+
+def test_scan_nearest_selection_precedes_cloud_budget(make_node):
+    node = make_node(
+        publish_scan=True, publish_point_cloud=True, expected_spokes=4,
+        range_resolution=0.5, min_range=0.0, max_range=3.0,
+        intensity_threshold=100, max_points_per_spoke=1,
+    )
+    for azimuth in (0, 90):
+        node._spoke_callback(spoke(azimuth, values=[0, 150, 0, 200, 0]))
+    node._finish_sweep()
+    np.testing.assert_allclose(node._scan_publisher.messages[0].ranges[:2], [0.5, 0.5])
+    cloud = node._point_cloud_publisher.messages[0]
+    np.testing.assert_allclose(np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)[:, 3], [200, 200])
+
+
+def test_partial_scan_start_stamp_gaps_duplicates_and_no_return(make_node):
+    node = make_node(
+        publish_scan=True, expected_spokes=4, range_resolution=0.5,
+        min_range=0.0, max_range=3.0, intensity_threshold=100,
+    )
+    for azimuth, values in ((90, [0, 150, 0, 0, 0]),
+                            (90, [0, 0, 0, 200, 0]),
+                            (270, [0] * 5)):
+        node._spoke_callback(spoke(azimuth, values=values, stamp=12))
+    node._finish_sweep()
+    scan = node._scan_publisher.messages[0]
+    assert scan.angle_min == pytest.approx(math.pi / 2)
+    assert scan.header.stamp.sec == 12
+    assert scan.ranges[0] == 0.5
+    assert math.isnan(scan.ranges[1]) and math.isnan(scan.ranges[3])
+    assert math.isinf(scan.ranges[2]) and scan.ranges[2] > 0
+    assert list(scan.intensities) == [150, 0, 0, 0]
+    assert scan.time_increment == 0.0
+    assert scan.range_max == 2.0
+
+
+def test_scan_timing_uses_sensor_timestamps_and_resets_on_irregularity(make_node):
+    node = make_node(publish_scan=True, min_range=0.0, max_range=10.0)
+    config = configuration(bins=5)
+    config.expected_rotation_rate = 4
+    node._configuration_callback(config)
+    for sweep_number in range(2):
+        for index, azimuth in enumerate((0, 90, 180, 270)):
+            message = spoke(azimuth, stamp=10 + sweep_number, version=1, values=[0, 30000, 0, 0, 0])
+            message.header.stamp.nanosec = index * 62500000
+            if sweep_number and index == 2:
+                message.header.stamp.nanosec += 20000000
+            node._spoke_callback(message)
+        node._finish_sweep()
+    first, second = node._scan_publisher.messages
+    assert first.scan_time == second.scan_time == 0.25
+    assert first.time_increment == 0.0625
+    assert second.time_increment == 0.0
+    node._spoke_callback(spoke(0, stamp=1, version=1, values=[0] * 5))
+    node._spoke_callback(spoke(90, stamp=1, version=1, values=[0] * 5))
+    node._finish_sweep()
+    assert node._scan_publisher.messages[-1].header.stamp.sec == 1
+    assert node._scan_publisher.messages[-1].time_increment == 0.0
+
+
+def test_off_grid_rays_do_not_fill_missing_bearings(make_node):
+    node = make_node(publish_scan=True, expected_spokes=4, min_range=0.0)
+    for azimuth in (0, 130, 180):
+        node._spoke_callback(spoke(azimuth))
+    node._finish_sweep()
+    assert math.isnan(node._scan_publisher.messages[0].ranges[1])
+
+
 @pytest.mark.parametrize('parameters', [
     {'range_resolution': 0.0}, {'min_range': float('nan')},
     {'max_range': float('inf')}, {'min_range': 4.0, 'max_range': 2.0},
@@ -293,6 +435,9 @@ def test_peak_selection_cloud_bytes_and_empty_cloud(make_node):
     {'max_buffered_spokes': 399}, {'max_range_bins': 0},
     {'intensity_threshold': -1}, {'max_points_per_spoke': -1},
     {'wrap_threshold_degrees': 360.0}, {'output_frame': '/radar'},
+    {'peak_selection': 'random'}, {'scan_selection': 'all'},
+    {'cfar_training_cells': 0}, {'cfar_guard_cells': -1},
+    {'cfar_threshold_offset': float('nan')}, {'min_peak_separation': -1.0},
 ])
 def test_invalid_startup_parameters_fail_early(make_node, parameters):
     with pytest.raises(ValueError):
@@ -324,6 +469,7 @@ def test_namespaced_dds_pipeline(context):
     try:
         assert node._image_publisher.topic_name == '/robot/navtech_radar/fft/image'
         assert node._point_cloud_publisher.topic_name == '/robot/navtech_radar/point_cloud'
+        assert node._scan_publisher.topic_name == '/robot/navtech_radar/scan'
         result = node.set_parameters([Parameter('intensity_threshold', value=1)])
         assert not result[0].successful
         spin_until(lambda: spoke_pub.get_subscription_count() == 1)

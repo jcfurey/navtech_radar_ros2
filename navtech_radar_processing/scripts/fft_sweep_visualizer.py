@@ -13,6 +13,21 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Image
+from tf2_ros import Buffer, TransformException, TransformListener
+
+
+def planar_yaw(rotation):
+    """Angle of a transformed +x axis; reject invalid or vertical headings."""
+    q = np.array([rotation.x, rotation.y, rotation.z, rotation.w], dtype=float)
+    norm = np.linalg.norm(q)
+    if not np.all(np.isfinite(q)) or not math.isfinite(norm) or norm < 1e-12:
+        return None
+    x, y, z, w = q / norm
+    forward_x = 1 - 2 * (y * y + z * z)
+    forward_y = 2 * (x * y + w * z)
+    if math.hypot(forward_x, forward_y) < 1e-6:
+        return None
+    return math.atan2(forward_y, forward_x)
 
 
 class SweepRenderer:
@@ -22,9 +37,10 @@ class SweepRenderer:
         self, min_range=2.0, max_range=150.0, image_width=1000,
         cartesian_size=800, lower_percentile=50.0, upper_percentile=99.7,
         contrast_alpha=0.2, gamma=1.0, annotate=True,
+        azimuth_offset_degrees=0.0,
     ):
         finite = (min_range, max_range, lower_percentile, upper_percentile,
-                  contrast_alpha, gamma)
+                  contrast_alpha, gamma, azimuth_offset_degrees)
         if not all(math.isfinite(value) for value in finite):
             raise ValueError('Display parameters must be finite')
         if not 0 <= min_range < max_range:
@@ -44,6 +60,7 @@ class SweepRenderer:
         self.contrast_alpha = contrast_alpha
         self.gamma = gamma
         self.annotate = annotate
+        self.azimuth_offset = math.radians(azimuth_offset_degrees)
         self._bounds = None
         self._epoch = None
         self._stamp = None
@@ -65,7 +82,7 @@ class SweepRenderer:
         ):
             raise ValueError('Invalid display configuration or image dimensions exceed limits')
 
-    def render(self, sweep, config):
+    def render(self, sweep, config, *, robot_bearing=None, heading=None):
         """Return annotated BGR8 polar and Cartesian images for one sweep."""
         self.validate_configuration(config)
         image = sweep.image
@@ -133,7 +150,7 @@ class SweepRenderer:
             axis = (center - np.arange(self.cartesian_size)) * extent / center
             x, y = np.meshgrid(axis, axis, indexing='ij')
             ranges = np.hypot(x, y)
-            angles = np.arctan2(y, x) % (2 * math.pi)
+            angles = (np.arctan2(y, x) - self.azimuth_offset) % (2 * math.pi)
             rows = np.rint(angles * grid.shape[0] / (2 * math.pi)).astype(np.int32)
             rows %= grid.shape[0]
             columns = np.floor((ranges / resolution - first) / stride)
@@ -145,43 +162,91 @@ class SweepRenderer:
         cartesian = self._colors[scaled[rows, columns]]
         cartesian[~valid] = 0
         if self.annotate:
-            polar = self._annotate_polar(polar, first * resolution, (last - 1) * resolution)
-            self._annotate_cartesian(cartesian, extent)
+            coverage = (int(present.sum()), config.azimuth_samples,
+                        image.height - len(set(sweep.encoder_values)))
+            polar = self._annotate_polar(
+                polar, first * resolution, (last - 1) * resolution,
+                sweep, config, coverage, robot_bearing, heading,
+            )
+            self._annotate_cartesian(
+                cartesian, extent, sweep, config, coverage, robot_bearing, heading,
+            )
         return polar, cartesian
 
     @staticmethod
     def _text(image, text, position, scale=0.45):
         cv2.putText(image, text, position, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, text, position, cv2.FONT_HERSHEY_SIMPLEX,
                     scale, (220, 220, 220), 1, cv2.LINE_AA)
 
-    def _annotate_polar(self, image, minimum, maximum):
+    @staticmethod
+    def _heading_text(heading):
+        if heading is None:
+            return 'Vehicle yaw: unavailable (TF)'
+        yaw, frame = heading
+        return f'Vehicle yaw in {frame}: {math.degrees(yaw) % 360:.1f} deg (+z)'
+
+    def _annotate_polar(self, image, minimum, maximum, sweep, config,
+                        coverage, robot_bearing, heading):
         height, width = image.shape[:2]
-        result = cv2.copyMakeBorder(image, 30, 56, 48, 18, cv2.BORDER_CONSTANT)
-        self._text(result, 'Azimuth (deg) / range (m)', (48, 20))
-        for angle in (0, 90, 180, 270):
-            row = 30 + round(angle * height / 360)
-            self._text(result, str(angle), (5, row + 5))
+        result = cv2.copyMakeBorder(image, 52, 98, 48, 18, cv2.BORDER_CONSTANT)
+        self._text(result, f'Bearing (+z, deg) / range (m) | {sweep.header.frame_id}', (48, 20))
+        self._text(result, self._heading_text(heading), (48, 40))
+        for encoder_angle in (0, 90, 180, 270):
+            row = 52 + round(encoder_angle * height / 360)
+            angle = (encoder_angle + math.degrees(self.azimuth_offset)) % 360
+            self._text(result, f'{angle:.0f}', (5, row + 5))
+        if robot_bearing is not None:
+            angle = (robot_bearing - self.azimuth_offset) % (2 * math.pi)
+            row = 52 + round(angle * height / (2 * math.pi)) % height
+            cv2.line(result, (48, row), (width + 47, row), (255, 220, 0), 1)
+            self._text(result, 'vehicle forward', (54, min(row + 16, height + 48)))
         for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
             col = 48 + round(fraction * (width - 1))
             self._text(result, f'{minimum + fraction * (maximum - minimum):.0f}',
-                       (min(col, width + 36), height + 48))
+                       (min(col, width + 36), height + 70))
         low, high = self._bounds
         self._text(result, f'FFT level: {low:.0f} (dark) - {high:.0f} (bright)',
-                   (48, height + 75))
+                   (48, height + 90))
+        observed, total, duplicates = coverage
+        self._text(result, f'Sweep {sweep.sweep_sequence} | {observed}/{total} bearings | '
+                   f'{total - observed} missing | {duplicates} duplicates', (48, height + 112))
+        self._text(result, f'{config.expected_rotation_rate} Hz | '
+                   f'{sweep.range_resolution * 100:.2f} cm/bin | raw FFT levels',
+                   (48, height + 134))
         return result
 
-    def _annotate_cartesian(self, image, extent):
+    def _annotate_cartesian(self, image, extent, sweep, config, coverage,
+                            robot_bearing, heading):
         center = (self.cartesian_size - 1) // 2
         for fraction in (1 / 3, 2 / 3, 1):
             radius = max(1, round(center * fraction))
             cv2.circle(image, (center, center), radius, (65, 65, 65), 1, cv2.LINE_AA)
             self._text(image, f'{extent * fraction:.0f} m',
                        (center + 5, max(35, center - radius + 15)))
-        cv2.arrowedLine(image, (center, center), (center, center - 30), (180, 180, 180))
-        cv2.arrowedLine(image, (center, center), (center - 30, center), (180, 180, 180))
-        self._text(image, 'x', (center + 5, center - 30))
-        self._text(image, 'y', (center - 40, center - 5))
-        self._text(image, 'Radar plan view | x forward, y left', (12, 20))
+        for degrees in range(0, 360, 45):
+            angle = math.radians(degrees)
+            radius = center * 0.88
+            position = (round(center - radius * math.sin(angle)),
+                        round(center - radius * math.cos(angle)))
+            self._text(image, f'{degrees}', (position[0] - 12, position[1] + 5))
+        cv2.drawMarker(image, (center, center), (180, 180, 180),
+                       cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
+        self._text(image, '+x', (center + 5, max(58, center - 40)))
+        self._text(image, '+y', (max(5, center - 60), center - 5))
+        if robot_bearing is not None:
+            length = max(16, round(center * 0.2))
+            tip = (round(center - length * math.sin(robot_bearing)),
+                   round(center - length * math.cos(robot_bearing)))
+            cv2.arrowedLine(image, (center, center), tip, (255, 220, 0), 2, cv2.LINE_AA)
+            self._text(image, 'vehicle forward', (tip[0] + 6, tip[1] - 6))
+        self._text(image, f'Radar plan view | {sweep.header.frame_id} | +x up, +y left', (12, 20))
+        self._text(image, self._heading_text(heading), (12, 40))
+        observed, total, duplicates = coverage
+        self._text(image, f'{observed}/{total} bearings | {total - observed} missing | '
+                   f'{duplicates} duplicates | {config.expected_rotation_rate} Hz',
+                   (12, image.shape[0] - 12))
 
 
 class FftSweepVisualizer(Node):
@@ -198,13 +263,21 @@ class FftSweepVisualizer(Node):
             'image_width': 1000, 'cartesian_size': 800,
             'lower_percentile': 50.0, 'upper_percentile': 99.7,
             'contrast_alpha': 0.2, 'gamma': 1.0, 'annotate': True,
+            'azimuth_offset_degrees': 0.0,
+            'robot_frame': '', 'heading_frame': '',
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value, ParameterDescriptor(read_only=True))
         self._renderer = SweepRenderer(**{
             name: self.get_parameter(name).value for name in defaults
-            if not name.endswith('_topic')
+            if not name.endswith(('_topic', '_frame'))
         })
+        self._robot_frame = self.get_parameter('robot_frame').value
+        self._heading_frame = self.get_parameter('heading_frame').value
+        if any(frame.startswith('/') for frame in (self._robot_frame, self._heading_frame)):
+            raise ValueError('TF frame names must have no leading slash')
+        self._tf_buffer = Buffer(node=self)
+        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
         self._configuration = None
         self._polar_publisher = self.create_publisher(
             Image, self.get_parameter('polar_topic').value, 1
@@ -236,7 +309,12 @@ class FftSweepVisualizer(Node):
         ):
             return
         try:
-            polar, cartesian = self._renderer.render(message, self._configuration)
+            robot_bearing = self._lookup_yaw(message.header.frame_id, message.header.stamp)
+            yaw = self._lookup_yaw(self._heading_frame, message.header.stamp)
+            heading = None if yaw is None else (yaw, self._heading_frame)
+            polar, cartesian = self._renderer.render(
+                message, self._configuration, robot_bearing=robot_bearing, heading=heading,
+            )
         except ValueError as error:
             self.get_logger().warning(str(error), throttle_duration_sec=5.0)
             return
@@ -252,6 +330,19 @@ class FftSweepVisualizer(Node):
                 output.data = array('B')
                 output.data.frombytes(memoryview(np.ascontiguousarray(pixels)).cast('B'))
                 publisher.publish(output)
+
+    def _lookup_yaw(self, target, stamp):
+        if not self._robot_frame or not target:
+            return None
+        # Use the sweep acquisition time; latest TF can belong to a different
+        # pose after a bag seek or while display processing is behind playback.
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                target, self._robot_frame, rclpy.time.Time.from_msg(stamp),
+            )
+        except TransformException:
+            return None
+        return planar_yaw(transform.transform.rotation)
 
 
 def main(args=None):

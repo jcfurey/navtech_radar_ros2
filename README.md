@@ -40,6 +40,7 @@ topics without changing the source bag:
 /navtech_radar/fft/sweep     navtech_radar_msgs/FftSweep
 /navtech_radar/fft/image     sensor_msgs/Image (mono16)
 /navtech_radar/point_cloud   sensor_msgs/PointCloud2 (optional, lossy)
+/navtech_radar/scan          sensor_msgs/LaserScan (optional, lossy)
 ```
 
 The TAMU workspace's `view_bag.sh` launches this pipeline automatically.
@@ -50,9 +51,17 @@ The TAMU workspace's `view_bag.sh` launches this pipeline automatically.
 and its configuration and publishes two `bgr8` display images:
 
 - `navtech_radar/fft/display`: cropped, labeled range–azimuth image.
-- `navtech_radar/fft/cartesian`: top-down radar image with range rings, +x up
-  and +y left. It uses encoder angles in the radar frame; it does not apply TF,
-  a mount offset, or the point-cloud visualization's azimuth offset.
+- `navtech_radar/fft/cartesian`: top-down radar image with range rings, bearing
+  ticks, +x up and +y left. Both images show coverage, missing/duplicate bearings,
+  frame name and scan rate. TF supplies a cyan vehicle-forward marker and vehicle
+  yaw in the requested reference frame at the sweep's acquisition timestamp.
+  If that transform is unavailable, yaw is labeled unavailable.
+
+Set `robot_frame` and `heading_frame` to enable the TF overlays; the TAMU launch
+sets `lester/base` and `lester/map`. Yaw is counterclockwise around reference +z
+from reference +x, not a geographic compass heading. TF is used for annotations;
+image pixels stay in the radar frame. The upside-down TAMU mount is respected
+when projecting the vehicle's forward axis into that frame.
 
 The default display range is 2–150 m. Range columns are reduced to at most
 1000 using maximum pooling, preserving narrow peaks. Encoder values place rows
@@ -80,7 +89,68 @@ and `annotate` (true). Gamma below 1 brightens weaker returns. The playback
 workspace starts this node and configures RViz automatically. Its
 `radar_images:=false` launch option returns to the raw image display.
 
+`azimuth_offset_degrees` rotates the derived Cartesian projection and polar
+bearing labels. The TAMU launch shares this value with cloud and scan conversion.
+The raw encoder grid and all canonical messages remain unchanged.
+
 ![Recorded FFT sweep before and after display processing](docs/fft_display_comparison.png)
+
+Updated recorded-data previews: [plan view with heading](docs/radar_heading_plan.png)
+and [range–azimuth view](docs/radar_heading_polar.png).
+
+## Planar detections and scans
+
+The assembler can publish both multiple detections per spoke as `PointCloud2`
+and one detection per bearing as `LaserScan`. Enable `publish_point_cloud` and/or
+`publish_scan`. Both retain the input radar frame and raw FFT intensity units;
+cloud z is zero. Mounting is supplied by TF.
+
+`peak_selection=threshold` preserves the original local-maxima threshold mode.
+The TAMU launch defaults to `cfar`: cell-averaging background estimation with
+16 training cells and 4 guard cells **per side**, an additive threshold offset
+of 3000 raw FFT units, and the existing 22000 minimum intensity. Complete
+training windows are required. Maxima closer than `min_peak_separation` (0.5 m)
+are reduced to the strongest, with ties preferring nearer bins. These are
+empirical settings for this 16-bit recording; additive raw-level filtering
+does not imply a calibrated false-alarm probability. Clutter boundaries can
+still produce detections.
+
+Clouds retain the strongest `max_points_per_spoke` peaks (0 means all), in range
+order. `scan_selection=nearest` chooses the nearest filtered peak before that
+cloud budget is applied; `strongest` instead chooses the largest FFT level.
+Thus a scan is useful for a compact planar view, while the cloud retains
+multiple reflectors along a bearing.
+
+The scan has the configured number of bearings, positive angle increment, and
+no duplicated 360° endpoint. Its first angle is the first acquired spoke's
+bearing, including the derived azimuth offset, and its header is that spoke's
+sensor timestamp. Initial partial sweeps therefore may start at a nonzero angle;
+`angle_max` may exceed 2π. Missing bearings are `NaN`; observed bearings with no
+selected return are `+inf`, with intensity 0. Off-grid rays farther than a
+quarter angular cell are omitted instead of interpolated into gaps. Duplicate
+bearings use the selected nearest/strongest policy.
+
+`scan_time` comes from the configured rotation period. `time_increment` is
+nonzero only when per-spoke timestamps agree with that uniform acquisition
+schedule within 10% of a cell period (at least 1 µs), without duplicates or
+off-grid rays. Otherwise it is 0, representing a snapshot. This conversion is
+lossy radar detection data: a missing detection is not evidence of free space,
+and LaserScan consumers can make assumptions specific to laser sensing.
+
+```bash
+# TAMU workspace: turn on both RViz displays and their publication.
+./view_bag.sh radar_scan:=true radar_point_cloud:=true
+# Select the strongest radar reflector per scan bearing.
+./view_bag.sh radar_scan:=true radar_scan_selection:=strongest
+# Reproduce the original fixed-threshold extraction.
+./view_bag.sh radar_point_cloud:=true radar_peak_selection:=threshold
+```
+
+Other extraction parameters are `cfar_training_cells`, `cfar_guard_cells`,
+`cfar_threshold_offset` and `min_peak_separation`; the TAMU launch prefixes
+these with `radar_`. Set a suitable intensity floor and CFAR offset for other
+sample depths or recordings. Scan/cloud publishers use sensor-data QoS and
+publish empty/all-no-detection results to clear previous sweeps.
 
 ## Runtime behavior
 
@@ -107,7 +177,8 @@ report stale input while `/clock` is absent or paused.
 The assembler preserves the incoming frame. `output_frame` defaults to empty;
 if set, it requires that same input frame. It does not transform coordinates.
 Use TF for mounting transforms. The optional `azimuth_offset_degrees` adjusts
-only the visualization point cloud, not the canonical FFT data.
+derived scan/cloud bearings, not the canonical FFT data. Give the visualizer
+the same value to keep its Cartesian view aligned.
 
 Sweeps never mix configuration versions, range-bin counts, sample depths, or
 frames. Configuration changes finish the preceding sweep with its original

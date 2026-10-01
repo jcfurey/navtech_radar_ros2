@@ -16,7 +16,7 @@ from rclpy.qos import HistoryPolicy
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.qos import QoSProfile
 from rclpy.qos import ReliabilityPolicy
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import Image, LaserScan, PointCloud2, PointField
 
 
 @dataclass
@@ -44,12 +44,20 @@ class FftSweepAssembler(Node):
             'sweep_topic': 'navtech_radar/fft/sweep',
             'image_topic': 'navtech_radar/fft/image',
             'point_cloud_topic': 'navtech_radar/point_cloud',
+            'scan_topic': 'navtech_radar/scan',
             'output_frame': '',
             'range_resolution': 0.0438,
             'expected_spokes': 400,
             'publish_partial_sweeps': True,
             'minimum_spokes': 2,
             'publish_point_cloud': False,
+            'publish_scan': False,
+            'scan_selection': 'nearest',
+            'peak_selection': 'threshold',
+            'cfar_training_cells': 16,
+            'cfar_guard_cells': 4,
+            'cfar_threshold_offset': 3000.0,
+            'min_peak_separation': 0.5,
             'min_range': 2.0,
             'max_range': 200.0,
             'intensity_threshold': 22000,
@@ -77,6 +85,13 @@ class FftSweepAssembler(Node):
         self._publish_point_cloud = bool(
             self.get_parameter('publish_point_cloud').value
         )
+        self._publish_scan = self.get_parameter('publish_scan').value
+        self._scan_selection = self.get_parameter('scan_selection').value
+        self._peak_selection = self.get_parameter('peak_selection').value
+        self._cfar_training = self.get_parameter('cfar_training_cells').value
+        self._cfar_guard = self.get_parameter('cfar_guard_cells').value
+        self._cfar_offset = self.get_parameter('cfar_threshold_offset').value
+        self._peak_separation = self.get_parameter('min_peak_separation').value
         self._min_range = float(self.get_parameter('min_range').value)
         self._max_range = float(self.get_parameter('max_range').value)
         self._threshold = int(
@@ -103,6 +118,7 @@ class FftSweepAssembler(Node):
         self._encoder_size = None
         self._sample_bit_depth = None
         self._configuration_frame = None
+        self._rotation_rate = 0
         self._last_angle = None
         self._spokes: list[StoredSpoke] = []
         self._sweep_sequence = 0
@@ -143,6 +159,9 @@ class FftSweepAssembler(Node):
             str(self.get_parameter('point_cloud_topic').value),
             qos_profile_sensor_data,
         )
+        self._scan_publisher = self.create_publisher(
+            LaserScan, self.get_parameter('scan_topic').value, qos_profile_sensor_data,
+        )
         self._configuration_subscription = self.create_subscription(
             RadarConfiguration,
             str(self.get_parameter('configuration_topic').value),
@@ -160,6 +179,7 @@ class FftSweepAssembler(Node):
         for name in (
             'range_resolution', 'min_range', 'max_range',
             'azimuth_offset_degrees', 'wrap_threshold_degrees',
+            'cfar_threshold_offset', 'min_peak_separation',
         ):
             if not math.isfinite(self.get_parameter(name).value):
                 raise ValueError(f'{name} must be finite')
@@ -169,6 +189,14 @@ class FftSweepAssembler(Node):
             raise ValueError('ranges must satisfy 0 <= min_range < max_range')
         if not 0 <= self._threshold <= 65535 or self._max_points < 0:
             raise ValueError('invalid intensity_threshold or max_points_per_spoke')
+        if self._peak_selection not in ('threshold', 'cfar'):
+            raise ValueError('peak_selection must be threshold or cfar')
+        if self._scan_selection not in ('nearest', 'strongest'):
+            raise ValueError('scan_selection must be nearest or strongest')
+        if not 1 <= self._cfar_training <= 1024 or not 0 <= self._cfar_guard <= 1024:
+            raise ValueError('CFAR cells per side must be training [1,1024], guard [0,1024]')
+        if self._cfar_offset < 0 or self._peak_separation < 0:
+            raise ValueError('CFAR offset and peak separation must be nonnegative')
         if not 0 < self._wrap_threshold < 2 * math.pi:
             raise ValueError('wrap_threshold_degrees must be between 0 and 360')
         if not 1 <= self._minimum_spokes <= self._expected_spokes <= 65535:
@@ -204,6 +232,7 @@ class FftSweepAssembler(Node):
             message.configuration_version, message.range_resolution,
             message.azimuth_samples, message.encoder_size, message.range_bins,
             message.sample_bit_depth, message.header.frame_id,
+            message.expected_rotation_rate,
         )
         if key == self._configuration_key:
             return
@@ -218,6 +247,7 @@ class FftSweepAssembler(Node):
         self._encoder_size = int(message.encoder_size)
         self._sample_bit_depth = int(message.sample_bit_depth)
         self._configuration_frame = message.header.frame_id
+        self._rotation_rate = message.expected_rotation_rate
 
         self.get_logger().info(
             f'Using configuration version {self._configuration_version}: '
@@ -361,7 +391,13 @@ class FftSweepAssembler(Node):
 
         self._sweep_publisher.publish(sweep)
         self._image_publisher.publish(image)
-        point_count = self._publish_cloud(image.header, ordered)
+        # Extract once for both derived products. Scan selection precedes the
+        # cloud's point budget so a strong distant return cannot hide a near one.
+        peaks = ([self._extract_peak_bins(s.values) for s in ordered]
+                 if self._publish_scan or self._publish_point_cloud else None)
+        point_count = self._publish_cloud(image.header, ordered, peaks)
+        if self._publish_scan:
+            self._publish_laser_scan(image.header, spokes[0], ordered, peaks)
 
         self._sweep_sequence = (self._sweep_sequence + 1) % (1 << 32)
         if self._sweep_sequence == 1 or self._sweep_sequence % 40 == 0:
@@ -372,21 +408,25 @@ class FftSweepAssembler(Node):
                 f'{point_count} selected points'
             )
 
-    def _extract_spoke_points(
-        self, values: np.ndarray, angle: float
-    ) -> np.ndarray | None:
+    def _extract_peak_bins(self, values: np.ndarray) -> np.ndarray:
+        """Local maxima, optional additive CA-CFAR, then range suppression.
+
+        Training/guard counts are per side. Use complete windows only; raw FFT
+        levels are not calibrated linear power, so no false-alarm probability
+        or multiplicative power-domain threshold is implied.
+        """
         if values.size < 3 or self._range_resolution <= 0.0:
-            return None
+            return np.empty(0, dtype=np.int64)
 
         first_bin = max(
-            1, int(math.ceil(self._min_range / self._range_resolution))
+            1, int(math.ceil(min(self._min_range / self._range_resolution, values.size)))
         )
         last_bin = min(
             values.size - 1,
-            int(math.floor(self._max_range / self._range_resolution)) + 1,
+            int(math.floor(min(self._max_range / self._range_resolution, values.size))) + 1,
         )
         if last_bin <= first_bin:
-            return None
+            return np.empty(0, dtype=np.int64)
 
         center = values[first_bin:last_bin]
         peak_mask = (
@@ -395,15 +435,41 @@ class FftSweepAssembler(Node):
             & (center >= values[first_bin + 1:last_bin + 1])
         )
         bins = np.flatnonzero(peak_mask) + first_bin
+        if self._peak_selection == 'cfar' and bins.size:
+            guard, train = self._cfar_guard, self._cfar_training
+            margin = guard + train
+            bins = bins[(bins >= margin) & (bins < values.size - margin)]
+            sums = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
+            noise = (sums[bins - guard] - sums[bins - guard - train]
+                     + sums[bins + guard + train + 1] - sums[bins + guard + 1]) / (2 * train)
+            bins = bins[values[bins] > noise + self._cfar_offset]
+            # Collapse nearby maxima into the strongest reflector. Sorting is
+            # stable so equal levels deterministically prefer the nearer bin.
+            if bins.size and self._peak_separation > 0:
+                ranked = bins[np.argsort(-values[bins].astype(np.int32), kind='stable')]
+                suppressed = np.zeros(values.size, dtype=bool)
+                separation = int(math.ceil(min(
+                    self._peak_separation / self._range_resolution, values.size
+                )))
+                kept = []
+                for index in ranked:
+                    if not suppressed[index]:
+                        kept.append(index)
+                        suppressed[max(0, index - separation + 1):index + separation] = True
+                bins = np.asarray(sorted(kept), dtype=np.int64)
+        return bins
+
+    def _extract_spoke_points(
+        self, values: np.ndarray, angle: float, bins=None,
+    ) -> np.ndarray | None:
+        bins = self._extract_peak_bins(values) if bins is None else bins
         if bins.size == 0:
             return None
 
         if self._max_points > 0 and bins.size > self._max_points:
             intensities = values[bins]
-            keep = np.argpartition(intensities, -self._max_points)[
-                -self._max_points:
-            ]
-            bins = bins[keep]
+            keep = np.argsort(-intensities.astype(np.int32), kind='stable')[:self._max_points]
+            bins = np.sort(bins[keep])
 
         ranges = bins.astype(np.float32) * self._range_resolution
         bearing = angle + self._azimuth_offset
@@ -414,12 +480,14 @@ class FftSweepAssembler(Node):
         points[:, 3] = values[bins]
         return points
 
-    def _publish_cloud(self, header, spokes: list[StoredSpoke]) -> int:
+    def _publish_cloud(self, header, spokes: list[StoredSpoke], peaks=None) -> int:
         if not self._publish_point_cloud:
             return 0
 
         # Do projection only for sweeps that pass the publication policy.
-        spoke_points = [self._extract_spoke_points(s.values, s.angle) for s in spokes]
+        spoke_points = [self._extract_spoke_points(
+            s.values, s.angle, None if peaks is None else peaks[index],
+        ) for index, s in enumerate(spokes)]
         spoke_points = [points for points in spoke_points if points is not None]
         points = (
             np.concatenate(spoke_points) if spoke_points
@@ -450,6 +518,64 @@ class FftSweepAssembler(Node):
         cloud.is_dense = True
         self._point_cloud_publisher.publish(cloud)
         return cloud.width
+
+    def _publish_laser_scan(self, header, first, spokes, peaks) -> None:
+        """One detection per bearing; no angular interpolation across gaps.
+
+        Anchor the angle grid at the first acquired spoke so the header is the
+        acquisition time of ray zero, even for an initial partial revolution.
+        """
+        count = self._expected_spokes
+        increment = 2 * math.pi / count
+        scan = LaserScan()
+        scan.header = header
+        scan.angle_min = float((first.angle + self._azimuth_offset) % (2 * math.pi))
+        scan.angle_increment = float(increment)
+        scan.angle_max = scan.angle_min + (count - 1) * scan.angle_increment
+        scan.scan_time = 1.0 / self._rotation_rate if self._rotation_rate else 0.0
+        scan.range_min = self._min_range
+        scan.range_max = min(self._max_range, (first.values.size - 1) * self._range_resolution)
+        if scan.range_max < scan.range_min:
+            return
+        # NaN: unobserved angle. +inf: observed angle with no selected return.
+        ranges = np.full(count, np.nan, dtype=np.float32)
+        intensities = np.zeros(count, dtype=np.float32)
+        observed = np.zeros(count, dtype=bool)
+        timing_valid = bool(self._rotation_rate)
+        nominal_dt = scan.scan_time / count
+        first_ns = first.stamp.sec * 1_000_000_000 + first.stamp.nanosec
+        for spoke, bins in zip(spokes, peaks):
+            position = ((spoke.angle - first.angle) % (2 * math.pi)) / increment
+            index = round(position) % count
+            # A LaserScan cannot encode arbitrary encoder angles. Reject
+            # off-grid rays instead of stretching them into missing sectors.
+            error = abs((position - index + count / 2) % count - count / 2)
+            if error > 0.25:
+                timing_valid = False
+                continue
+            stamp_ns = spoke.stamp.sec * 1_000_000_000 + spoke.stamp.nanosec
+            timing_valid &= (not observed[index] and abs(
+                (stamp_ns - first_ns) * 1e-9 - index * nominal_dt
+            ) <= max(1e-6, nominal_dt * 0.1))
+            if not observed[index]:
+                ranges[index] = np.inf
+            observed[index] = True
+            if not bins.size:
+                continue
+            selected = (bins[0] if self._scan_selection == 'nearest'
+                        else bins[np.argmax(spoke.values[bins])])
+            distance = float(selected * self._range_resolution)
+            intensity = float(spoke.values[selected])
+            if (not math.isfinite(float(ranges[index]))
+                or (self._scan_selection == 'nearest' and distance < ranges[index])
+                or (self._scan_selection == 'strongest' and intensity > intensities[index])):
+                ranges[index], intensities[index] = distance, intensity
+        # Irregular or duplicate timestamps describe a snapshot, not a made-up
+        # constant-rate acquisition trajectory for downstream motion correction.
+        scan.time_increment = nominal_dt if timing_valid else 0.0
+        scan.ranges = array('f', ranges)
+        scan.intensities = array('f', intensities)
+        self._scan_publisher.publish(scan)
 
 
 def main(args=None) -> None:

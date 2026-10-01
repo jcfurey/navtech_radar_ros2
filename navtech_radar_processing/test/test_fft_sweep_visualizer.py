@@ -1,12 +1,15 @@
 """Test display geometry and contrast without modifying the canonical FFT data."""
 
 from array import array
+import math
 
-from fft_sweep_visualizer import FftSweepVisualizer, SweepRenderer
+from fft_sweep_visualizer import FftSweepVisualizer, planar_yaw, SweepRenderer
+from geometry_msgs.msg import Quaternion, TransformStamped
 from navtech_radar_msgs.msg import FftSweep, RadarConfiguration
 import numpy as np
 import pytest
 from rclpy.context import Context
+from rclpy.parameter import Parameter
 from rclpy.serialization import deserialize_message, serialize_message
 
 
@@ -119,7 +122,7 @@ def test_constant_image_is_finite_and_annotation_does_not_change_projection_size
     polar, plan = renderer().render(sweep, config)
     assert not np.any(polar) and not np.any(plan)
     polar, plan = renderer(annotate=True).render(sweep, config)
-    assert polar.shape == (90, 99, 3)
+    assert polar.shape == (154, 99, 3)
     assert plan.shape == (65, 65, 3)
 
 
@@ -146,6 +149,7 @@ def test_malformed_sweeps_are_rejected(failure):
     {'min_range': -1.0}, {'max_range': float('inf')}, {'max_range': 0.0},
     {'image_width': 0}, {'cartesian_size': 8192}, {'gamma': 0.0},
     {'contrast_alpha': 0.0}, {'lower_percentile': 100.0},
+    {'azimuth_offset_degrees': float('nan')},
 ])
 def test_invalid_display_settings_fail_at_startup(options):
     with pytest.raises(ValueError):
@@ -181,6 +185,72 @@ def test_node_publishes_valid_bgr8_images_in_namespace():
             assert output.header == sweep.header
             assert output.step == output.width * 3
             assert len(output.data) == output.step * output.height
+    finally:
+        node.destroy_node()
+        context.try_shutdown()
+
+
+def test_shared_azimuth_offset_rotates_only_derived_projection():
+    values = np.zeros((4, 33), dtype=np.uint16)
+    values[:, 20] = [10, 20, 30, 40]
+    sweep, config = fixture_messages(values)
+    before = serialize_message(sweep)
+    original_polar, _ = renderer().render(sweep, config)
+    render = renderer(azimuth_offset_degrees=90.0)
+    polar, plan = render.render(sweep, config)
+    np.testing.assert_array_equal(plan[32, 12], render._colors[64])
+    np.testing.assert_array_equal(plan[52, 32], render._colors[128])
+    np.testing.assert_array_equal(polar, original_polar)
+    assert serialize_message(sweep) == before
+
+
+def test_heading_quaternion_handles_inverted_mount_and_invalid_orientation():
+    # Radar mounted upside down, with a -0.2 rad yaw in the vehicle frame.
+    # Invert the mount to express the vehicle's forward vector in radar axes.
+    inverse = Quaternion(x=-math.cos(0.1), y=math.sin(0.1), z=0.0, w=0.0)
+    assert planar_yaw(inverse) == pytest.approx(-0.2)
+    assert planar_yaw(Quaternion()) == 0.0
+    assert planar_yaw(Quaternion(w=0.0)) is None
+    assert planar_yaw(Quaternion(x=float('nan'), w=1.0)) is None
+    assert planar_yaw(Quaternion(y=math.sqrt(0.5), w=math.sqrt(0.5))) is None
+
+
+def test_heading_overlay_labels_reference_frame_and_coverage(monkeypatch):
+    labels = []
+    monkeypatch.setattr(SweepRenderer, '_text', staticmethod(
+        lambda image, text, position, scale=0.45: labels.append(text)
+    ))
+    sweep, config = fixture_messages(np.arange(132).reshape(4, 33), [0, 0, 90, 180])
+    renderer(annotate=True).render(
+        sweep, config, robot_bearing=0.1, heading=(math.pi / 2, 'local_map'),
+    )
+    assert any('yaw in local_map: 90.0 deg' in label for label in labels)
+    assert any('3/4 bearings' in label and '1 missing' in label and '1 duplicates' in label
+               for label in labels)
+    assert 'vehicle forward' in labels
+
+
+def test_tf_heading_uses_sweep_stamp_and_does_not_reuse_missing_transform():
+    context = Context()
+    context.init()
+    node = FftSweepVisualizer(context=context, parameter_overrides=[
+        Parameter('robot_frame', value='base'), Parameter('heading_frame', value='map'),
+    ])
+    try:
+        for seconds, yaw in ((10, 0.0), (12, math.pi / 2)):
+            transform = TransformStamped()
+            transform.header.frame_id = 'map'
+            transform.child_frame_id = 'base'
+            transform.header.stamp.sec = seconds
+            transform.transform.rotation.z = math.sin(yaw / 2)
+            transform.transform.rotation.w = math.cos(yaw / 2)
+            node._tf_buffer.set_transform(transform, 'test')
+        sweep, _ = fixture_messages(np.zeros((4, 33)))
+        sweep.header.stamp.sec = 11
+        assert node._lookup_yaw('map', sweep.header.stamp) == pytest.approx(math.pi / 4)
+        assert node._lookup_yaw('missing', sweep.header.stamp) is None
+        sweep.header.stamp.sec = 1
+        assert node._lookup_yaw('map', sweep.header.stamp) is None
     finally:
         node.destroy_node()
         context.try_shutdown()

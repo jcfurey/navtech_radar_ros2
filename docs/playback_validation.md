@@ -79,3 +79,53 @@ odd-length 16-bit payloads, and oversized frames before any overlay/allocation.
 These are integration constraints found by source inspection, not a claim that
 the SDK's normal TCP receiver passes truncated buffers. The SDK's bundled ROS
 examples remain excluded from colcon and are not the production ROS API.
+
+## Heading, adaptive detections and LaserScan (2026-10-01)
+
+Built `navtech_radar_processing` and `tamu_bag_viz` on ROS 2 Lyrical. The
+registered suites passed: 83 processing tests and 17 driver tests. Added cases
+cover additive CFAR against explicit scalar training windows, unsigned sample
+overflow, clutter transitions, peak separation, scan nearest/strongest policy,
+the independent cloud point budget, duplicates and missing bearings, partial
+scan angle/stamp alignment, acquisition timing, azimuth offsets, and timestamped
+TF heading queries including an inverted radar mount.
+
+The first 4,000 recorded spokes were passed through the real adapter and
+assembler callbacks with CFAR, cloud and scan outputs enabled. A
+`rosbag2_py.SequentialReader` also supplied recorded TF to the visualizer's
+buffer. The existing placeholder mount was added as a static transform. Each
+emitted FFT row was compared with the original bag sample, indexed by sensor
+timestamp and sweep counter. ROS serialization, scan ranges/angles/frame,
+coverage and point counts were checked.
+
+Results:
+
+- 10 sweeps: one initial 234-row partial sweep, then nine 400-row sweeps;
+  166 spokes remained buffered. No rejected spokes or discarded sweeps.
+- All emitted uint16 FFT samples and checked encoder values matched the source.
+- The partial scan had 166 missing bearings; each complete scan had none.
+- Complete sweeps retained 808–842 cloud points and 324–337 finite scan returns
+  with the default CFAR settings. The last sweep retained 808 cloud points,
+  versus 3,316 with fixed-threshold extraction and the same 48-point budget.
+  This measures selection density, not accuracy against labeled targets.
+- `scan_time=0.25` s. Maximum timestamp deviations from the nominal 625 µs
+  angular cell period ranged from about 71 to 388 µs per sweep. Every sampled
+  sweep therefore used `time_increment=0` rather than a uniform motion model.
+- Map yaw was available on eight of the ten sweeps and the vehicle-forward
+  transform on nine. Early sweeps precede enough recorded TF history; missing
+  heading remains explicitly unavailable.
+
+The previews [plan view](radar_heading_plan.png) and
+[range–azimuth image](radar_heading_polar.png) show the final complete sweep with
+timestamped TF annotations. Yaw is relative to `lester/map`; the radar mount
+remains a visualization placeholder, so these are not calibrated geographic
+heading or radar-to-lidar alignment results.
+
+A headless installed launch in isolated local domain 92, with
+`radar_namespace=front`, `radar_scan=true` and `radar_point_cloud=true`, delivered
+five messages on each of `/front/navtech_radar/scan`,
+`/front/navtech_radar/point_cloud` and `/front/navtech_radar/fft/cartesian` to
+real DDS subscribers. Message dimensions, range count, period and radar frame
+were checked. All launch processes exited cleanly after a single parent SIGINT.
+This exercises the installed pipeline and namespace handling, but does not
+validate the entire bag, detection accuracy, or the RViz GUI.
