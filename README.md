@@ -21,6 +21,8 @@ The intended boundary is:
 
 See [docs/driver_design.md](docs/driver_design.md) for the research findings,
 proposed messages, QoS, and implementation sequence.
+The [hardware reference](docs/cts350x.md) includes Navtech's official CTS350-X
+datasheet and compares its standard settings with the recorded configuration.
 
 ## Bag playback
 
