@@ -60,7 +60,7 @@ and its configuration and publishes two `bgr8` display images:
 Set `robot_frame` and `heading_frame` to enable the TF overlays; the TAMU launch
 sets `lester/base` and `lester/map`. Yaw is counterclockwise around reference +z
 from reference +x, not a geographic compass heading. TF is used for annotations;
-image pixels stay in the radar frame. The upside-down TAMU mount is respected
+image pixels stay in the radar frame. The full mounting rotation is respected
 when projecting the vehicle's forward axis into that frame.
 
 The default display range is 2–150 m. Range columns are reduced to at most
@@ -179,6 +179,18 @@ if set, it requires that same input frame. It does not transform coordinates.
 Use TF for mounting transforms. The optional `azimuth_offset_degrees` adjusts
 derived scan/cloud bearings, not the canonical FFT data. Give the visualizer
 the same value to keep its Cartesian view aligned.
+
+The TAMU workspace's provisional mount uses `radar_mount_roll=0.0` so the
+radar's +y axis remains leftward in the robot frame. A roll of approximately π
+around +x reverses +y and +z, horizontally mirroring a planar cloud/scan even
+when the radar-frame images look correct. The earlier LWLRF-derived 3.14 rad
+roll was removed following that observed mismatch. Translation and yaw remain
+provisional; a physical calibration should replace the placeholder transform.
+The workspace correction is preserved in [docs/tamu_planar_mount.patch](docs/tamu_planar_mount.patch)
+because the surrounding TAMU playback workspace is not part of this repository.
+Apply that patch from a workspace root still using the old roll, then rebuild
+`lester_description` and `tamu_bag_viz` and restart playback. It updates both
+the static TF launch default and the robot model's matching joint default.
 
 Sweeps never mix configuration versions, range-bin counts, sample depths, or
 frames. Configuration changes finish the preceding sweep with its original

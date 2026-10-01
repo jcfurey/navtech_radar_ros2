@@ -129,3 +129,23 @@ real DDS subscribers. Message dimensions, range count, period and radar frame
 were checked. All launch processes exited cleanly after a single parent SIGINT.
 This exercises the installed pipeline and namespace handling, but does not
 validate the entire bag, detection accuracy, or the RViz GUI.
+
+## Planar mounting correction (2026-10-01)
+
+The cloud appeared horizontally mirrored relative to the correct radar-frame
+images. The provisional LWLRF-derived roll of 3.14 rad reverses the mounting
+frame's +y direction: a return at radar `(0, 10, 0)` becomes approximately
+`(-0.225, -9.997, 0.016)` after that rotation and the -0.0225 rad yaw, before
+translation. With roll 0, it becomes `(0.225, 9.997, 0)`, preserving left/right.
+
+The workspace launch and robot-description defaults now use roll 0. The
+[workspace patch](tamu_planar_mount.patch) preserves both edits in this driver
+repository. The historical `LWLRF` source is unchanged. This corrects the
+display convention; translation and yaw still require physical calibration.
+The image projection and point extraction formulas are unchanged. The previews
+were regenerated with the corrected mount for their TF-derived forward markers.
+
+Validation expands the installed robot Xacro, checks agreement with the launch
+default, and verifies that +y retains positive mounting-frame y. A second
+headless DDS playback check also verifies the live static TF has zero roll and
+pitch while delivering the namespaced radar scan, cloud and image products.

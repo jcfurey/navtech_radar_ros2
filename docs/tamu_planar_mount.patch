@@ -1,0 +1,22 @@
+diff --git a/src/tamu_bag_viz/launch/view.launch.py b/src/tamu_bag_viz/launch/view.launch.py
+--- a/src/tamu_bag_viz/launch/view.launch.py
++++ b/src/tamu_bag_viz/launch/view.launch.py
+@@ -357,5 +357,7 @@
+         DeclareLaunchArgument('radar_mount_y', default_value='0.275'),
+         DeclareLaunchArgument('radar_mount_z', default_value='0.0'),
+-        DeclareLaunchArgument('radar_mount_roll', default_value='3.14'),
++        # The derived radar frame uses +x forward, +y left and +z up. The
++        # borrowed LWLRF roll of pi mirrors planar returns in the robot frame.
++        DeclareLaunchArgument('radar_mount_roll', default_value='0.0'),
+         DeclareLaunchArgument('radar_mount_pitch', default_value='0.0'),
+         DeclareLaunchArgument('radar_mount_yaw', default_value='-0.0225'),
+diff --git a/src/lester_description/urdf/lester.urdf.xacro b/src/lester_description/urdf/lester.urdf.xacro
+--- a/src/lester_description/urdf/lester.urdf.xacro
++++ b/src/lester_description/urdf/lester.urdf.xacro
+@@ -8,5 +8,5 @@
+   <xacro:arg name="navtech_y" default="0.275"/>
+   <xacro:arg name="navtech_z" default="0.0"/>
+-  <xacro:arg name="navtech_roll" default="3.14"/>
++  <xacro:arg name="navtech_roll" default="0.0"/>
+   <xacro:arg name="navtech_pitch" default="0.0"/>
+   <xacro:arg name="navtech_yaw" default="-0.0225"/>
