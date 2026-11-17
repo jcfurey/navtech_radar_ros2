@@ -37,8 +37,8 @@ ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap 
 
 Omit `bag` for an external player. Options include `cloud`, `scan`,
 `peak_selection`, `scan_selection`, `rate`, and `implementation:=python`
-for the reference nodes. The fixed frame in the included RViz profile is
-`navtech`. `robot_frame` and `heading_frame` enable the optional TF overlays
+for the reference nodes. `frame_id` sets the adapter radar frame and the RViz
+fixed frame (default `navtech`). `robot_frame` and `heading_frame` enable the optional TF overlays
 when the corresponding transforms are available. Robot-specific mounting and
 the full TAMU viewer belong to the surrounding TAMU workspace.
 
@@ -98,8 +98,7 @@ The color scale shows raw FFT levels, not calibrated power or height. Contrast
 history resets when configuration changes or timestamps move backward.
 
 These are lossy visualization products. `FftSweep`, `FftSpoke`, and the original
-`mono16` image are unmodified. The radar cloud stays planar because the source
-contains no elevation measurement. The visualizer requires a matching nonzero
+`mono16` image are unmodified. Spoke-local detections have zero measured elevation. The visualizer requires a matching nonzero
 configuration version and supports up to 2048 azimuth rows and 16384 range bins.
 Image publishers and the sweep subscription use reliable, volatile QoS, depth 1.
 The native visualizer renders each view only when that view has subscribers.
@@ -131,8 +130,35 @@ and [range–azimuth view](docs/radar_heading_polar.png).
 
 The assembler can publish both multiple detections per spoke as `PointCloud2`
 and one detection per bearing as `LaserScan`. Enable `publish_point_cloud` and/or
-`publish_scan`. Both retain the input radar frame and raw FFT intensity units;
-cloud z is zero. Mounting is supplied by TF.
+`publish_scan`. Both use the input radar frame and raw FFT intensity units. Each spoke measures
+range and azimuth in its local z=0 plane.
+
+For mapping on a moving vehicle, set `deskew_fixed_frame` to a continuous
+odometry frame. Each cloud point is transformed from the radar pose at its
+spoke timestamp to the radar pose at the first spoke timestamp, using full 3D
+translation and rotation. The cloud header names that radar frame and time.
+Pitch, roll or vertical motion can therefore contribute to the corrected z
+coordinate. The scan retains the measured range and bearing at acquisition.
+[tf2 two-time transform API](https://github.com/ros2/geometry2/blob/rolling/tf2_ros_py/tf2_ros/buffer.py)
+
+The TAMU viewer can set `lester/odom` automatically when the cloud is enabled.
+The launch integration is available for external workspace checkouts.
+[TAMU viewer patch](docs/tamu_cloud_deskew.patch)
+
+For standalone playback with the TAMU mount TF available, run
+
+```bash
+ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap \
+  frame_id:=lester/navtech deskew_fixed_frame:=lester/odom
+```
+
+Standalone playback defaults to an empty `deskew_fixed_frame` and publishes
+cloud points at their individual measurement poses. With compensation enabled,
+a cloud requires a positive first timestamp and TF for every spoke contributing
+points. The assembler holds one completed cloud for late TF and retries for up
+to one wall-clock second or until the next cloud supersedes it. If coverage is
+still incomplete, it drops that cloud. Raw sweeps and scans continue during TF
+outages. A moving reflector can still change position during the revolution.
 
 `peak_selection=threshold` preserves the original local-maxima threshold mode.
 The TAMU launch defaults to `cfar`: cell-averaging background estimation with
@@ -234,11 +260,18 @@ valid configuration active.
 
 Rows are stably sorted by encoder count and duplicates remain separate rows.
 `publish_partial_sweeps` defaults to true, subject to `minimum_spokes` (2).
-When false, a sweep must contain exactly `expected_spokes` unique encoder counts
-and no duplicates. This count check cannot prove angular coverage of a malformed
-stream. A backward sensor timestamp discards the pending sweep, allowing bag
-loops or seeks to start a new sweep. The final pending sweep remains buffered
-until a wrap or configuration/geometry change; shutdown does not publish it.
+When false, each nominal angular cell must contain exactly one spoke, and each
+ray must also fit its first-spoke-relative scan cell within a quarter cell.
+With a configuration, the supplied angle must agree with the encoder bearing
+within half an encoder tick across the 0° wrap. Derived products then use the
+encoder bearing. Before configuration, the assembler uses the supplied angle
+and requires distinct raw encoder counts for a complete sweep.
+
+A backward sensor timestamp or a forward gap of at least one configured
+revolution discards the pending sweep and begins a new one at the incoming
+spoke. When rotation rate is unknown, the fallback boundary is a gap longer
+than `fallback_max_spoke_gap_sec` (default 1.0 s). A pending final sweep is
+published only when a subsequent wrap or geometry change closes it.
 
 `max_buffered_spokes` (2048) and `max_range_bins` (16384) bound retained raw data
 to at most 64 MiB with the defaults, excluding DDS queues and output buffers.

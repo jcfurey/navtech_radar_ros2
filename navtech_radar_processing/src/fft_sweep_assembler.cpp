@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "cloud_deskew.hpp"
 #include "navtech_radar_msgs/msg/fft_sweep.hpp"
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
 #include "planar_products.hpp"
@@ -22,6 +23,7 @@ public:
     resolution_ = param("range_resolution", 0.0438);
     axis_ = {resolution_, 0};
     count_ = param("expected_spokes", 400);
+    fallback_gap_ = param("fallback_max_spoke_gap_sec", 1.0);
     partial_ = param("publish_partial_sweeps", true);
     minimum_ = param("minimum_spokes", 2);
     max_rows_ = param("max_buffered_spokes", 2048);
@@ -48,6 +50,9 @@ public:
       throw std::invalid_argument("invalid peak_selection");
     if (selection != "nearest" && selection != "strongest")
       throw std::invalid_argument("invalid scan_selection");
+    if (!(fallback_gap_ > 0) || !std::isfinite(fallback_gap_))
+      throw std::invalid_argument(
+          "fallback_max_spoke_gap_sec must be finite and positive");
     if (depth <= 0 || frame_.find('/') == 0 || !(resolution_ > 0) ||
         !std::isfinite(resolution_) || !std::isfinite(offset_) ||
         !(wrap_ > 0 && wrap_ < tau) || minimum_ < 1 || count_ < minimum_ ||
@@ -70,6 +75,12 @@ public:
     clouds_ = create_publisher<Cloud>(
         param<std::string>("point_cloud_topic", "navtech_radar/point_cloud"),
         rclcpp::SensorDataQoS());
+    const auto fixed = param<std::string>("deskew_fixed_frame", "");
+    if (fixed.find('/') == 0)
+      throw std::invalid_argument(
+          "deskew_fixed_frame must have no leading slash");
+    if (publish_cloud_ && !fixed.empty())
+      deskew_ = std::make_unique<CloudDeskew>(*this, fixed, clouds_);
     scans_ = create_publisher<Scan>(
         param<std::string>("scan_topic", "navtech_radar/scan"),
         rclcpp::SensorDataQoS());
@@ -143,14 +154,31 @@ private:
       return;
     }
     s->azimuth_angle = positive_angle(s->azimuth_angle);
+    if (config_) {
+      const double encoder_angle = tau * s->azimuth / config_->encoder_size;
+      if (std::abs(std::remainder(s->azimuth_angle - encoder_angle, tau)) >
+          tau / (2 * config_->encoder_size) + 1e-12) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "FFT spoke angle disagrees with encoder count");
+        return;
+      }
+      s->azimuth_angle = encoder_angle;
+    }
     if (!pending_.empty()) {
       const auto &prev = *pending_.back();
-      if (nanoseconds(s->header.stamp) < nanoseconds(prev.header.stamp))
+      const auto gap =
+          nanoseconds(s->header.stamp) - nanoseconds(prev.header.stamp);
+      const int rate = config_ ? config_->expected_rotation_rate : 0;
+      const bool forward_jump = rate ? gap >= (1000000000LL + rate - 1) / rate
+                                     : gap * 1e-9 > fallback_gap_;
+      if (gap < 0 || forward_jump) {
         pending_.clear();
-      else if (s->data.size() != prev.data.size() ||
-               s->sample_bit_depth != prev.sample_bit_depth ||
-               s->header.frame_id != prev.header.frame_id ||
-               s->azimuth_angle < prev.azimuth_angle - wrap_)
+        if (deskew_)
+          deskew_->clear();
+      } else if (s->data.size() != prev.data.size() ||
+                 s->sample_bit_depth != prev.sample_bit_depth ||
+                 s->header.frame_id != prev.header.frame_id ||
+                 s->azimuth_angle < prev.azimuth_angle - wrap_)
         finish();
     }
     if (pending_.size() >= static_cast<size_t>(max_rows_)) {
@@ -161,6 +189,22 @@ private:
     pending_.push_back(std::move(s));
   }
 
+  bool complete(double start) const {
+    if (pending_.size() != static_cast<size_t>(count_))
+      return false;
+    std::vector<bool> scan_seen(count_), encoder_seen(config_ ? count_ : 65536);
+    for (const auto &s : pending_) {
+      const int encoder =
+          config_ ? encoder_cell(s->azimuth, count_, config_->encoder_size)
+                  : s->azimuth;
+      const auto cell = scan_cell(s->azimuth_angle, start, count_);
+      if (!cell || scan_seen[*cell] || encoder_seen[encoder])
+        return false;
+      scan_seen[*cell] = encoder_seen[encoder] = true;
+    }
+    return true;
+  }
+
   void finish() {
     if (pending_.size() < static_cast<size_t>(minimum_)) {
       pending_.clear();
@@ -168,17 +212,13 @@ private:
     }
     const auto &first = *pending_.front();
     const auto end = pending_.back()->header.stamp;
-    std::stable_sort(
-        pending_.begin(), pending_.end(),
-        [](const auto &a, const auto &b) { return a->azimuth < b->azimuth; });
-    if (!partial_ && (pending_.size() != static_cast<size_t>(count_) ||
-                      std::adjacent_find(pending_.begin(), pending_.end(),
-                                         [](const auto &a, const auto &b) {
-                                           return a->azimuth == b->azimuth;
-                                         }) != pending_.end())) {
+    if (!partial_ && !complete(first.azimuth_angle)) {
       pending_.clear();
       return;
     }
+    std::stable_sort(
+        pending_.begin(), pending_.end(),
+        [](const auto &a, const auto &b) { return a->azimuth < b->azimuth; });
 
     // DDS volatile outputs have no history for future subscribers. Avoid
     // materializing a multi-megabyte image for a scan-only consumer.
@@ -243,16 +283,24 @@ private:
       cloud = empty_cloud(first.header);
     if (!scan && !cloud)
       return;
+    std::vector<SpokePoints> spans;
     for (const auto &s : pending_) {
       const auto &bins = detector_.select(s->data, axis_, settings_);
       if (scan)
         scan->add(*s, bins, axis_, settings_.nearest);
-      if (cloud)
+      if (cloud && !bins.empty()) {
         append_points(*cloud, *s, bins, axis_, offset_, settings_.cloud_limit,
                       cloud_bins_);
+        if (deskew_)
+          spans.push_back({s->header.stamp, cloud->width});
+      }
     }
-    if (cloud)
-      clouds_->publish(*cloud);
+    if (cloud) {
+      if (deskew_)
+        deskew_->submit(std::move(*cloud), std::move(spans));
+      else
+        clouds_->publish(*cloud);
+    }
     if (scan) {
       const auto &msg = scan->finish();
       if (msg.range_max >= msg.range_min)
@@ -261,12 +309,13 @@ private:
   }
 
   std::string frame_;
-  double resolution_, offset_, wrap_;
+  double resolution_, offset_, wrap_, fallback_gap_;
   int count_, minimum_, max_rows_, max_bins_;
   bool partial_, publish_cloud_, publish_scan_;
   uint32_t sequence_{};
   DetectionSettings settings_;
   RangeAxis axis_;
+  std::unique_ptr<CloudDeskew> deskew_;
   PeakDetector detector_;
   std::vector<int> cloud_bins_;
   Config::ConstSharedPtr config_;

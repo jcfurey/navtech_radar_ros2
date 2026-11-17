@@ -5,9 +5,10 @@ from array import array
 from dataclasses import dataclass
 import math
 
+from cloud_deskew import CloudDeskew
 from navtech_radar_msgs.msg import FftSpoke, FftSweep, RadarConfiguration
 import numpy as np
-from radar_geometry import RangeAxis, ros_bearing
+from radar_geometry import encoder_cell, RangeAxis, ros_bearing, scan_cell
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -47,8 +48,10 @@ class FftSweepAssembler(Node):
             'point_cloud_topic': 'navtech_radar/point_cloud',
             'scan_topic': 'navtech_radar/scan',
             'output_frame': '',
+            'deskew_fixed_frame': '',
             'range_resolution': 0.0438,
             'expected_spokes': 400,
+            'fallback_max_spoke_gap_sec': 1.0,
             'publish_partial_sweeps': True,
             'minimum_spokes': 2,
             'publish_point_cloud': False,
@@ -78,6 +81,7 @@ class FftSweepAssembler(Node):
         self._range_resolution = float(
             self.get_parameter('range_resolution').value
         )
+        self._fallback_gap = self.get_parameter('fallback_max_spoke_gap_sec').value
         self._range_axis = RangeAxis(self._range_resolution, 0.0)
         self._expected_spokes = int(self.get_parameter('expected_spokes').value)
         self._publish_partial = bool(
@@ -161,6 +165,11 @@ class FftSweepAssembler(Node):
             str(self.get_parameter('point_cloud_topic').value),
             qos_profile_sensor_data,
         )
+        fixed = self.get_parameter('deskew_fixed_frame').value
+        if fixed.startswith('/'):
+            raise ValueError('deskew_fixed_frame must have no leading slash')
+        self._deskew = (CloudDeskew(self, fixed, self._publish_cloud_message)
+                        if self._publish_point_cloud and fixed else None)
         self._scan_publisher = self.create_publisher(
             LaserScan, self.get_parameter('scan_topic').value, qos_profile_sensor_data,
         )
@@ -185,6 +194,8 @@ class FftSweepAssembler(Node):
         ):
             if not math.isfinite(self.get_parameter(name).value):
                 raise ValueError(f'{name} must be finite')
+        if not math.isfinite(self._fallback_gap) or self._fallback_gap <= 0:
+            raise ValueError('fallback_max_spoke_gap_sec must be finite and positive')
         if self._range_resolution <= 0:
             raise ValueError('range_resolution must be positive')
         if not 0 <= self._min_range < self._max_range:
@@ -296,12 +307,22 @@ class FftSweepAssembler(Node):
         values.setflags(write=False)
 
         angle %= 2 * math.pi
+        if self._encoder_size is not None:
+            encoder_angle = math.tau * message.azimuth / self._encoder_size
+            if abs(math.remainder(angle - encoder_angle, math.tau)) > math.pi / self._encoder_size + 1e-12:
+                self._reject_spoke('FFT spoke angle disagrees with encoder count')
+                return
+            angle = encoder_angle
         if self._spokes:
             previous = self._spokes[-1]
-            stamp_key = (message.header.stamp.sec, message.header.stamp.nanosec)
-            if stamp_key < (previous.stamp.sec, previous.stamp.nanosec):
-                # Seeking/looping a bag or a sensor clock reset ends this epoch.
+            gap_ns = ((message.header.stamp.sec - previous.stamp.sec) * 1_000_000_000
+                      + message.header.stamp.nanosec - previous.stamp.nanosec)
+            forward_jump = (gap_ns * self._rotation_rate >= 1_000_000_000 if self._rotation_rate
+                            else gap_ns * 1e-9 > self._fallback_gap)
+            if gap_ns < 0 or forward_jump:
                 self._reset_sweep()
+                if self._deskew:
+                    self._deskew.clear()
             elif (
                 len(message.data) != previous.values.size
                 or message.sample_bit_depth != previous.sample_bit_depth
@@ -354,13 +375,16 @@ class FftSweepAssembler(Node):
             self._dropped_sweeps += 1
             return
 
-        unique_azimuths = len({spoke.azimuth for spoke in spokes})
-        missing_spokes = max(0, self._expected_spokes - unique_azimuths)
-        duplicate_spokes = len(spokes) - unique_azimuths
-        complete = unique_azimuths == self._expected_spokes and duplicate_spokes == 0
-        if not complete and not self._publish_partial:
-            self._dropped_sweeps += 1
-            return
+        cells = {encoder_cell(s.azimuth, self._expected_spokes, self._encoder_size)
+                 if self._encoder_size is not None else s.azimuth for s in spokes}
+        missing_spokes = max(0, self._expected_spokes - len(cells))
+        duplicate_spokes = len(spokes) - len(cells)
+        if not self._publish_partial:
+            scan_cells = {scan_cell(s.angle, spokes[0].angle, self._expected_spokes) for s in spokes}
+            if (len(spokes) != self._expected_spokes or missing_spokes or duplicate_spokes
+                    or None in scan_cells or len(scan_cells) != self._expected_spokes):
+                self._dropped_sweeps += 1
+                return
 
         # Stable sorting preserves duplicate encoder rows and their metadata.
         ordered = sorted(spokes, key=lambda spoke: spoke.azimuth)
@@ -485,10 +509,19 @@ class FftSweepAssembler(Node):
             return 0
 
         # Do projection only for sweeps that pass the publication policy.
-        spoke_points = [self._extract_spoke_points(
-            s.values, s.angle, None if peaks is None else peaks[index],
-        ) for index, s in enumerate(spokes)]
-        spoke_points = [points for points in spoke_points if points is not None]
+        chunks = []
+        for index, spoke in enumerate(spokes):
+            points = self._extract_spoke_points(spoke.values, spoke.angle,
+                                                None if peaks is None else peaks[index])
+            if points is not None:
+                chunks.append((spoke.stamp, points))
+        if self._deskew:
+            self._deskew.submit(header, chunks)
+        else:
+            self._publish_cloud_message(header, [points for _, points in chunks])
+        return sum(len(points) for _, points in chunks)
+
+    def _publish_cloud_message(self, header, spoke_points):
         points = (
             np.concatenate(spoke_points) if spoke_points
             else np.empty((0, 4), dtype='<f4')
@@ -517,7 +550,6 @@ class FftSweepAssembler(Node):
         )
         cloud.is_dense = True
         self._point_cloud_publisher.publish(cloud)
-        return cloud.width
 
     def _publish_laser_scan(self, header, first, spokes, peaks) -> None:
         """One detection per bearing; no angular interpolation across gaps.
@@ -545,12 +577,8 @@ class FftSweepAssembler(Node):
         nominal_dt = scan.scan_time / count
         first_ns = first.stamp.sec * 1_000_000_000 + first.stamp.nanosec
         for spoke, bins in zip(spokes, peaks):
-            position = ((spoke.angle - first.angle) % (2 * math.pi)) / increment
-            index = round(position) % count
-            # A LaserScan cannot encode arbitrary encoder angles. Reject
-            # off-grid rays instead of stretching them into missing sectors.
-            error = abs((position - index + count / 2) % count - count / 2)
-            if error > 0.25:
+            index = scan_cell(spoke.angle, first.angle, count)
+            if index is None:
                 timing_valid = False
                 continue
             stamp_ns = spoke.stamp.sec * 1_000_000_000 + spoke.stamp.nanosec

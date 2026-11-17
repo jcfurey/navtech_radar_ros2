@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -29,6 +30,15 @@ inline double positive_angle(double angle) {
 
 inline int64_t nanoseconds(const builtin_interfaces::msg::Time &t) {
   return static_cast<int64_t>(t.sec) * 1000000000 + t.nanosec;
+}
+
+// Use the same relative grid and tolerance in strict assembly and LaserScan.
+inline std::optional<size_t> scan_cell(double angle, double start, int count) {
+  const double position = positive_angle(angle - start) / (tau / count);
+  const auto cell = static_cast<size_t>(std::llround(position));
+  if (std::abs(position - cell) > 0.25)
+    return {};
+  return cell % count;
 }
 
 struct DetectionSettings {
@@ -172,13 +182,12 @@ public:
   }
   void add(const Spoke &s, const std::vector<int> &bins, const RangeAxis &axis,
            bool nearest) {
-    const auto position = positive_angle(s.azimuth_angle - start_) / increment_;
-    const auto cell = static_cast<size_t>(std::llround(position));
-    if (std::abs(position - cell) > 0.25) {
+    const auto cell = scan_cell(s.azimuth_angle, start_, scan.ranges.size());
+    if (!cell) {
       regular_ = false;
       return;
     }
-    const auto i = cell % scan.ranges.size();
+    const auto i = *cell;
     auto &range = scan.ranges[i];
     auto &level = scan.intensities[i];
     const auto elapsed = (nanoseconds(s.header.stamp) - first_stamp_) * 1e-9;

@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from ament_index_python.packages import get_package_prefix
 from compare_playback import compare, run_pipeline, stop
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
 from nav_ross.msg import HighPrecisionFFTData, nav_msg
 from navtech_radar_msgs.msg import FftSpoke, FftSweep, RadarConfiguration
 import numpy as np
@@ -121,3 +123,93 @@ def test_canonical_calibration_over_dds(suffix):
     directions = np.array([[1, 0], [0, -1], [-1, 0], [0, 1]])
     for column, radius in enumerate((3.0, 5.0)):
         np.testing.assert_allclose(points[:, column, :2], radius * directions, atol=1e-6)
+
+
+@pytest.mark.parametrize('suffix', ['', '_py'])
+def test_strict_sweeps_and_motion_compensation(suffix):
+    # Each accepted ray measures 2 m. TF moves the radar by (3, 0, 3) m
+    # and turns it 90 degrees relative to its initial, already rotated pose.
+    ns = '/deskew_' + uuid4().hex
+    radar, fixed = ns[1:] + '_radar', ns[1:] + '_odom'
+    cfg = RadarConfiguration(configuration_version=1, range_resolution=0.5, range_bins=8,
+                             encoder_size=360, azimuth_samples=4, expected_rotation_rate=4,
+                             sample_bit_depth=16)
+    cfg.header.frame_id = radar
+    with rclpy.init(), ExitStack() as cleanup:
+        node = rclpy.create_node('fixture', namespace=ns)
+        cleanup.callback(node.destroy_node)
+        config_pub = node.create_publisher(RadarConfiguration, 'navtech_radar/configuration',
+                                           QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        pub = node.create_publisher(FftSpoke, 'navtech_radar/fft/spoke', 64)
+        tf = TransformBroadcaster(node)
+        received = {'fft/sweep': {}, 'point_cloud': {}, 'scan': {}}
+        for topic, msg, qos in [('fft/sweep', FftSweep, 8), ('point_cloud', PointCloud2, qos_profile_sensor_data),
+                                ('scan', LaserScan, qos_profile_sensor_data)]:
+            node.create_subscription(msg, 'navtech_radar/' + topic,
+                                     lambda m, key=topic: received[key].update({m.header.stamp.sec: m}), qos)
+        package = 'navtech_radar_processing'
+        exe = Path(get_package_prefix(package)) / 'lib' / package / ('fft_sweep_assembler' + suffix)
+        cmd = [str(exe), '--ros-args', '-r', '__ns:=' + ns]
+        for option in ['publish_scan:=true', 'publish_point_cloud:=true', 'publish_partial_sweeps:=false',
+                       'deskew_fixed_frame:=' + fixed, 'min_range:=0.0']:
+            cmd += ['-p', option]
+        child = subprocess.Popen(cmd)
+        cleanup.callback(stop, child)
+        config_pub.publish(cfg)
+
+        def wait(condition, retry=None):
+            deadline = time.monotonic() + 10
+            again = 0.0
+            while not condition():
+                assert child.poll() is None and time.monotonic() < deadline, received.keys()
+                if retry and time.monotonic() >= again:
+                    retry()
+                    again = time.monotonic() + 0.2
+                rclpy.spin_once(node, timeout_sec=0.01)
+
+        def send(sec, azimuths=(0, 90, 180, 270, 0), *, angles=None, seconds=None):
+            for i, az in enumerate(azimuths):
+                ray = FftSpoke(configuration_version=1, azimuth=az, sample_bit_depth=16,
+                               azimuth_angle=math.radians(az if angles is None else angles[i]),
+                               data=[0, 0, 0, 0, 30000, 0, 0, 0])
+                ray.header.frame_id = radar
+                ray.header.stamp.sec = sec if seconds is None else seconds[i]
+                ray.header.stamp.nanosec = i * 62500000
+                pub.publish(ray)
+
+        def pose(sec, last):
+            m = TransformStamped()
+            m.header.frame_id, m.child_frame_id = fixed, radar
+            m.header.stamp.sec = sec
+            m.header.stamp.nanosec = 187500000 if last else 0
+            yaw = math.pi if last else math.pi / 2
+            m.transform.rotation.z, m.transform.rotation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            m.transform.translation.x = 10.0
+            m.transform.translation.y = 3.0 if last else 0.0
+            m.transform.translation.z = 4.0 if last else 1.0
+            return m
+
+        wait(lambda: pub.get_subscription_count() and node.count_subscribers('/tf'))
+        wait(lambda: 100 in received['scan'], lambda: send(100))
+        send(1, seconds=[1, 1, 2, 2, 2])
+        send(3, azimuths=[0, 1, 180, 270, 0])
+        send(4, angles=[0, 180, 180, 270, 0])
+        send(0)
+        wait(lambda: 0 in received['scan'])
+        tf.sendTransform(pose(10, False))
+        send(10)
+        wait(lambda: 10 in received['fft/sweep'] and 10 in received['scan'])
+        for topic in ('fft/sweep', 'scan'):
+            assert not ({1, 2, 3, 4} & received[topic].keys())
+        assert 10 not in received['point_cloud']
+        wait(lambda: 10 in received['point_cloud'],
+             lambda: tf.sendTransform([pose(10, False), pose(10, True)]))
+        assert 0 not in received['point_cloud']
+        cloud = received['point_cloud'][10]
+        assert cloud.header == received['fft/sweep'][10].header
+        np.testing.assert_array_equal(received['scan'][10].ranges, [2] * 4)
+        phi = np.deg2rad(np.arange(4) * (30 - 90))
+        expected = np.column_stack((np.arange(4) + 2*np.cos(phi), 2*np.sin(phi),
+                                    np.arange(4), np.full(4, 30000)))
+        points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
+        np.testing.assert_allclose(points, expected, atol=1e-5)

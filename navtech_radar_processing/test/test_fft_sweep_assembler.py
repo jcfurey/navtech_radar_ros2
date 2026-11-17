@@ -530,3 +530,46 @@ def test_duplicate_empty_ray_invalidates_uniform_timing(make_node):
     scan = node._scan_publisher.messages[0]
     assert all(math.isnan(r) for r in scan.ranges)
     assert scan.time_increment == 0.0
+
+
+def test_gap_at_one_revolution_starts_new_partial_sweep(make_node):
+    node = make_node()
+    cfg = configuration()
+    cfg.expected_rotation_rate = 4
+    node._configuration_callback(cfg)
+    for az, ns in [(0, 0), (90, 62500000), (180, 312500000), (270, 375000000), (0, 437500000)]:
+        msg = spoke(az, version=1)
+        msg.header.stamp.nanosec = ns
+        node._spoke_callback(msg)
+    assert [list(s.encoder_values) for s in node._sweep_publisher.messages] == [[180, 270]]
+    assert node._sweep_publisher.messages[0].header.stamp.nanosec == 312500000
+
+
+def test_encoder_validation_is_circular_and_precedes_state_changes(make_node):
+    node = make_node()
+    node._configuration_callback(configuration())
+    node._spoke_callback(spoke(0, angle=359.8, version=1))
+    node._spoke_callback(spoke(90, angle=180, version=1, stamp=5))
+    node._spoke_callback(spoke(90, angle=90.4, version=1))
+    assert node._invalid_spokes == 1
+    assert [s.angle for s in node._spokes] == [0.0, math.pi / 2]
+
+
+@pytest.mark.parametrize('angles,accepted', [
+    ([0, 1, 180, 270], False), ([0, 120, 180, 270], False),
+    ([45, 135, 225, 315], True), ([0, 90, 180, 270], True),
+])
+def test_complete_requires_distinct_image_and_scan_cells(make_node, angles, accepted):
+    node = make_node(publish_partial_sweeps=False)
+    node._configuration_callback(configuration())
+    for a in angles:
+        node._spoke_callback(spoke(a, version=1))
+    node._finish_sweep()
+    assert bool(node._sweep_publisher.messages) == accepted
+
+
+def test_unknown_rate_uses_fallback_gap(make_node):
+    node = make_node(fallback_max_spoke_gap_sec=2.0)
+    for az, sec in [(0, 1), (90, 3), (180, 12), (270, 13), (0, 14)]:
+        node._spoke_callback(spoke(az, stamp=sec))
+    assert [list(s.encoder_values) for s in node._sweep_publisher.messages] == [[180, 270]]

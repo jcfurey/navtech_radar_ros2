@@ -1,0 +1,28 @@
+--- a/src/tamu_bag_viz/launch/view.launch.py
++++ b/src/tamu_bag_viz/launch/view.launch.py
+@@ -16,6 +16,7 @@
+ from launch.substitutions import AndSubstitution
+ from launch.substitutions import Command
+ from launch.substitutions import EnvironmentVariable
++from launch.substitutions import IfElseSubstitution
+ from launch.substitutions import FindExecutable
+ from launch.substitutions import LaunchConfiguration
+ from launch.substitutions import PathJoinSubstitution
+@@ -191,6 +192,9 @@
+             'max_range_bins': ParameterValue(
+                 LaunchConfiguration('radar_max_range_bins'), value_type=int
+             ),
++            'deskew_fixed_frame': ParameterValue(IfElseSubstitution(
++                LaunchConfiguration('radar_deskew_cloud'), if_value='lester/odom', else_value=''
++            ), value_type=str),
+             'publish_point_cloud': ParameterValue(
+                 LaunchConfiguration('radar_point_cloud'), value_type=bool
+             ),
+@@ -313,6 +317,7 @@
+         ),
+         DeclareLaunchArgument('robot_model', default_value='true'),
+         DeclareLaunchArgument('radar_point_cloud', default_value='false'),
++        DeclareLaunchArgument('radar_deskew_cloud', default_value='true'),
+         DeclareLaunchArgument(
+             'radar_scan', default_value='false',
+             description='Publish and display one radar detection per bearing as a LaserScan.',

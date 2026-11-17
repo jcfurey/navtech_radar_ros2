@@ -109,5 +109,5 @@ Visualization Manager:
     Current:
       Class: rviz_default_plugins/TopDownOrtho
       Name: Radar
-      Target Frame: navtech
+      Target Frame: <Fixed Frame>
       Scale: 7

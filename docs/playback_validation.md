@@ -241,3 +241,31 @@ at 3 m and 5 m on both installed assemblers, and the 7 m return lies outside
 the selected range. Other fixtures cover negative offsets, metric CFAR peak
 separation, the calibrated image projection, empty scan rays and zero-stamp TF.
 The recorded previews above use the corrected bearing with the zero-roll mount.
+
+## Sweep continuity and motion compensation
+
+The installed C++ and Python assemblers were tested with a forward timestamp
+jump, two distinct encoder counts in one angular cell, and contradictory
+encoder and angle fields. Each case produced a subsequent valid sweep after
+the incomplete group was discarded. A separate fixture combines a 90° rotation
+with 3 m of horizontal and 3 m of vertical translation from a nonidentity
+initial pose. Delivering the final TF after the raw sweep verifies interpolation,
+the sign of the correction, its z component, and publication of the complete
+cloud after TF arrives.
+
+For a recorded-data check, the standalone launch replayed the route 1/run 2
+turn near 869 s with the recorded odometry TF and the TAMU workspace's
+provisional static radar mount. Each return in the uncompensated cloud was
+matched to its sweep-row timestamp by encoder bearing. Its independently
+computed reference position was obtained by transforming it into `lester/odom`
+at acquisition, then back into `lester/navtech` at the first spoke.
+
+| Complete sweep | Returns | Median correction | Largest correction |
+| --- | ---: | ---: | ---: |
+| First turn fixture sweep | 1,004 | 0.831 m | 4.708 m |
+| Fifth turn fixture sweep | 878 | 1.317 m | 8.663 m |
+
+Both installed implementations agreed with those positions. The largest C++
+coordinate residual was below 4 µm against the same recorded poses. This
+measures numerical agreement with the TF trajectory. Absolute mapping accuracy
+also depends on the radar mount, timestamps, odometry and motion of reflectors.

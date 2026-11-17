@@ -8,12 +8,14 @@ find_package(navtech_radar_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
 add_executable(fft_sweep_assembler src/fft_sweep_assembler.cpp)
 target_compile_features(fft_sweep_assembler PRIVATE cxx_std_17)
 target_link_libraries(fft_sweep_assembler PRIVATE
+  tf2_geometry_msgs::tf2_geometry_msgs tf2_ros::tf2_ros
   rclcpp::rclcpp
   navtech_radar_msgs::navtech_radar_msgs__rosidl_typesupport_cpp
   sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
@@ -42,7 +44,7 @@ install(PROGRAMS
   RENAME fft_sweep_visualizer_py
 )
 
-install(FILES scripts/radar_geometry.py DESTINATION lib/${PROJECT_NAME})
+install(FILES scripts/radar_geometry.py scripts/cloud_deskew.py DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE)

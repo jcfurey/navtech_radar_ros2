@@ -9,6 +9,17 @@ def ros_bearing(encoder_angle, yaw_offset):
     return yaw_offset - encoder_angle
 
 
+def encoder_cell(encoder, count, size):
+    """Index a scalar or int64 array of counts, advancing clockwise on ties."""
+    return ((2 * encoder * count + size) // (2 * size)) % count
+
+
+def scan_cell(angle, start, count):
+    position = ((angle - start) % math.tau) / (math.tau / count)
+    nearest = round(position)
+    return nearest % count if abs(position - nearest) <= 0.25 else None
+
+
 @dataclass(frozen=True)
 class RangeAxis:
     spacing: float

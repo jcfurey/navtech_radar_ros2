@@ -225,7 +225,7 @@ def test_heading_overlay_labels_reference_frame_and_coverage(monkeypatch):
     monkeypatch.setattr(SweepRenderer, '_text', staticmethod(
         lambda image, text, position, scale=0.45: labels.append(text)
     ))
-    sweep, config = fixture_messages(np.arange(132).reshape(4, 33), [0, 0, 90, 180])
+    sweep, config = fixture_messages(np.arange(132).reshape(4, 33), [0, 1, 90, 180])
     renderer(annotate=True).render(
         sweep, config, robot_bearing=0.1, heading=(math.pi / 2, 'local_map'),
     )

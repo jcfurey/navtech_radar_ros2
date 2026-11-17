@@ -7,7 +7,7 @@ import math
 import cv2
 from navtech_radar_msgs.msg import FftSweep, RadarConfiguration
 import numpy as np
-from radar_geometry import RangeAxis
+from radar_geometry import encoder_cell, RangeAxis
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -115,10 +115,8 @@ class SweepRenderer:
         pooled = np.maximum.reduceat(
             pixels[:, first:last], np.arange(0, last - first, stride), axis=1
         )
-        row_indices = np.rint(
-            np.asarray(sweep.encoder_values, dtype=np.float64)
-            * config.azimuth_samples / config.encoder_size
-        ).astype(np.int32) % config.azimuth_samples
+        row_indices = encoder_cell(np.asarray(sweep.encoder_values, dtype=np.int64),
+                                   config.azimuth_samples, config.encoder_size)
         grid = np.zeros((config.azimuth_samples, pooled.shape[1]), dtype=np.uint16)
         np.maximum.at(grid, row_indices, pooled)
         present = np.zeros(config.azimuth_samples, dtype=bool)
@@ -149,7 +147,7 @@ class SweepRenderer:
             x, y = np.meshgrid(axis, axis, indexing='ij')
             ranges = np.hypot(x, y)
             angles = (self.azimuth_offset - np.arctan2(y, x)) % (2 * math.pi)
-            rows = np.rint(angles * grid.shape[0] / (2 * math.pi)).astype(np.int32)
+            rows = np.floor(angles * grid.shape[0] / (2 * math.pi) + 0.5).astype(np.int32)
             rows %= grid.shape[0]
             columns = np.floor(((ranges - range_axis.offset) / range_axis.spacing - first) / stride)
             valid = (ranges >= self.min_range) & (ranges <= extent) & (columns >= 0)
@@ -160,8 +158,8 @@ class SweepRenderer:
         cartesian = self._colors[scaled[rows, columns]]
         cartesian[~valid] = 0
         if self.annotate:
-            coverage = (int(present.sum()), config.azimuth_samples,
-                        image.height - len(set(sweep.encoder_values)))
+            observed = int(present.sum())
+            coverage = (observed, config.azimuth_samples, image.height - observed)
             polar = self._annotate_polar(
                 polar, range_axis.metres(first), range_axis.metres(last - 1),
                 sweep, config, coverage, robot_bearing, heading,

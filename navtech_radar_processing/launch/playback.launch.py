@@ -16,10 +16,11 @@ def start(context):
     common = {'use_sim_time': sim_time}
     nodes = [
         Node(package='navtech_radar_driver', executable='legacy_bag_driver' + suffix,
-             parameters=[common]),
+             parameters=[common, {'frame_id': ParameterValue(LaunchConfiguration('frame_id'), value_type=str)}]),
         Node(package='navtech_radar_processing', executable='fft_sweep_assembler' + suffix,
              parameters=[common, {
                  'publish_point_cloud': ParameterValue(LaunchConfiguration('cloud'), value_type=bool),
+                 'deskew_fixed_frame': ParameterValue(LaunchConfiguration('deskew_fixed_frame'), value_type=str),
                  'publish_scan': ParameterValue(LaunchConfiguration('scan'), value_type=bool),
                  'peak_selection': LaunchConfiguration('peak_selection'),
                  'scan_selection': LaunchConfiguration('scan_selection'),
@@ -29,7 +30,8 @@ def start(context):
                                   'heading_frame': ParameterValue(LaunchConfiguration('heading_frame'), value_type=str)}]),
         Node(package='rviz2', executable='rviz2', condition=IfCondition(LaunchConfiguration('rviz')),
              parameters=[common], arguments=['-d', str(get_package_share_path('navtech_radar_processing')
-                                                        / 'config' / 'radar.rviz')]),
+                                                        / 'config' / 'radar.rviz'),
+                                               '-f', LaunchConfiguration('frame_id')]),
     ]
     if bag:
         nodes.append(ExecuteProcess(cmd=[
@@ -51,6 +53,8 @@ def generate_launch_description():
         DeclareLaunchArgument('cloud', default_value='true'),
         DeclareLaunchArgument('rviz', default_value='false'),
         DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument('frame_id', default_value='navtech'),
+        DeclareLaunchArgument('deskew_fixed_frame', default_value=''),
         DeclareLaunchArgument('robot_frame', default_value=''),
         DeclareLaunchArgument('heading_frame', default_value=''),
         OpaqueFunction(function=start),

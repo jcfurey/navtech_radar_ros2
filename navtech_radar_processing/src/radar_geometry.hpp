@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <utility>
 
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
@@ -11,6 +12,11 @@ namespace radar {
 // Encoder angles increase clockwise; yaw offsets are positive about ROS +z.
 inline double ros_bearing(double encoder_angle, double yaw_offset) {
   return yaw_offset - encoder_angle;
+}
+
+// The grid is centred on encoder zero. Half-cell ties advance clockwise.
+inline int encoder_cell(unsigned encoder, int count, unsigned size) {
+  return ((uint64_t(2) * encoder * count + size) / (2 * size)) % count;
 }
 
 struct RangeAxis {

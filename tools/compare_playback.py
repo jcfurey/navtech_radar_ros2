@@ -74,9 +74,11 @@ def run_pipeline(implementation, config, groups, sentinel, selection='nearest', 
     low = deepcopy(groups[0][0])
     low.header.stamp.sec = min(sentinel.header.stamp.sec + 1, 2147483647)
     low.header.stamp.nanosec = 999999999
+    low.azimuth = 0
     low.angle = 0.0
     high = deepcopy(low)
-    high.angle = 270.0
+    high.azimuth = round(0.75 * config.EncoderSize) % config.EncoderSize
+    high.angle = high.azimuth * 360.0 / config.EncoderSize
     with ExitStack() as cleanup:
         cleanup.callback(node.destroy_node)
         cfg_pub = node.create_publisher(nav_msg, 'legacy_config', 1)

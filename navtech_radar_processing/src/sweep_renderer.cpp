@@ -186,7 +186,7 @@ void SweepRenderer::update_projection(int rows, int cols, int first, int stride,
         continue;
       }
       const double angle = wrap(offset_ - std::atan2(axis[x], axis[y]), turn);
-      const int row = nearest(angle * rows / turn) % rows;
+      const int row = int(std::floor(angle * rows / turn + 0.5)) % rows;
       out[x] = row * cols +
                static_cast<int>(std::min(bin / stride, double(cols - 1)));
     }
@@ -270,16 +270,13 @@ void SweepRenderer::render(const Sweep &s, const Config &c,
   const int cols = (last - first + stride - 1) / stride;
   const int rows = c.azimuth_samples;
   cv::Mat1w grid(rows, cols, uint16_t(0));
-  std::vector<bool> present(rows), seen_encoder(c.encoder_size);
-  int duplicates = 0;
+  std::vector<bool> present(rows);
   // Pool directly into the encoder row so duplicate bearings keep the strongest
   // bin.
   for (size_t i = 0; i < image.height; ++i) {
     const int encoder = s.encoder_values[i];
-    const int row = nearest(double(encoder) * rows / c.encoder_size) % rows;
+    const int row = encoder_cell(encoder, rows, c.encoder_size);
     present[row] = true;
-    duplicates += seen_encoder[encoder];
-    seen_encoder[encoder] = true;
     auto *pooled = grid.ptr<uint16_t>(row);
     const auto *data = image.data.data() + i * image.step;
     for (int col = 0, bin = first; col < cols; ++col) {
@@ -298,7 +295,7 @@ void SweepRenderer::render(const Sweep &s, const Config &c,
   const int observed = std::count(present.begin(), present.end(), true);
   const auto coverage =
       cv::format("%d/%d bearings | %d missing | %d duplicates", observed, rows,
-                 rows - observed, duplicates);
+                 rows - observed, int(image.height) - observed);
   if (polar) {
     const int top = settings_.annotate ? 52 : 0,
               left = settings_.annotate ? 48 : 0;
