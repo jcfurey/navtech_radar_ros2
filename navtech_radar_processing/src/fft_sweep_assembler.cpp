@@ -135,6 +135,34 @@ private:
     count_ = config_->azimuth_samples;
   }
 
+  bool crossed_zero(const Spoke &previous, const Spoke &current,
+                    int64_t gap_ns) const {
+    if (current.azimuth_angle < previous.azimuth_angle - wrap_)
+      return true;
+    if (!config_)
+      return false;
+
+    // The Colossus FFT counter advances once per packet, modulo 65536.
+    const auto steps =
+        static_cast<uint16_t>(current.sweep_counter - previous.sweep_counter);
+    if (steps == 0 || (current.azimuth >= previous.azimuth && steps < count_))
+      return false;
+
+    // Test the forward path that passes through zero once. A half-cell tie
+    // gives no unique packet count. A known period also distinguishes this
+    // path from a counter reset or a small out-of-order encoder movement.
+    const int ticks =
+        config_->encoder_size + current.azimuth - previous.azimuth;
+    const double cells = double(ticks) * count_ / config_->encoder_size;
+    if (std::abs(cells - steps) >= 0.5)
+      return false;
+    const auto rate = config_->expected_rotation_rate;
+    return !rate || nanoseconds(previous.header.stamp) == 0 ||
+           nanoseconds(current.header.stamp) == 0 ||
+           std::abs(gap_ns * 1e-9 * rate -
+                    double(ticks) / config_->encoder_size) < 0.5;
+  }
+
   void accept(Spoke::UniquePtr s) {
     if (!valid_frame(s->header.frame_id) || !std::isfinite(s->azimuth_angle) ||
         s->header.stamp.nanosec >= 1000000000u ||
@@ -178,7 +206,7 @@ private:
       } else if (s->data.size() != prev.data.size() ||
                  s->sample_bit_depth != prev.sample_bit_depth ||
                  s->header.frame_id != prev.header.frame_id ||
-                 s->azimuth_angle < prev.azimuth_angle - wrap_)
+                 crossed_zero(prev, *s, gap))
         finish();
     }
     if (pending_.size() >= static_cast<size_t>(max_rows_)) {

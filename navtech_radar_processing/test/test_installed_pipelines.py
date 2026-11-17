@@ -213,3 +213,28 @@ def test_strict_sweeps_and_motion_compensation(suffix):
                                     np.arange(4), np.full(4, 30000)))
         points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
         np.testing.assert_allclose(points, expected, atol=1e-5)
+
+
+def test_packet_loss_across_encoder_zero():
+    cfg = nav_msg(range_resolution=0.5, AzimuthSamples=8, EncoderSize=360,
+                  BinSize=5000, RangeInBins=8, ExpectedRotationRate=4)
+
+    def recorded_spoke(tick):
+        angle = (tick % 8) * 45
+        levels = array('H', [0, 0, 0, 0, 30000 + tick, 0, 0, 0])
+        ray = HighPrecisionFFTData(angle=float(angle), azimuth=angle,
+                                   sweepCounter=(65530 + tick) % 65536, size=8, data=levels)
+        ray.header.stamp.sec = 10
+        ray.header.stamp.nanosec = tick * 31250000
+        return ray
+
+    # Lose five spokes around north and cross the uint16 counter rollover.
+    # Azimuth drops from 180 to 90 degrees, inside the ordinary wrap threshold.
+    groups = [[recorded_spoke(tick) for tick in ticks] for ticks in (range(5), range(10, 16))]
+    with rclpy.init():
+        results = [run_pipeline(impl, cfg, groups, recorded_spoke(16), mode='threshold')[0]
+                   for impl in ('cpp', 'python')]
+    compare(*results)
+    for ((sweep, _), scan, cloud), covered in zip(results[0], [5, 6]):
+        assert len(sweep.timestamps) == cloud.width == covered
+        assert sum(math.isfinite(r) for r in scan.ranges) == covered

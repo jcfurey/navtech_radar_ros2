@@ -198,11 +198,39 @@ def compare(left, right):
         np.testing.assert_array_equal(a[:, 2:], b[:, 2:])
 
 
+def check_boundary_loss(bag):
+    """Remove a contiguous burst across one known wrap and verify both resulting sweeps."""
+    config, groups, sentinel = recorded_input(bag, 2)
+    first, second = groups[1:]
+    count = config.AzimuthSamples
+    if count < 4 or len(first) != count or len(second) != count:
+        raise ValueError('Boundary-loss check needs two complete revolutions after warmup')
+    rows = first + second
+    if any((b.sweepCounter - a.sweepCounter) % 65536 != 1 for a, b in zip(rows, rows[1:])):
+        raise ValueError('Boundary-loss check needs a continuous input packet sequence')
+    parts = [first[:count // 2 + 1], second[count // 4:]]
+    last_old, first_new = parts[0][-1], parts[1][0]
+    if not 0 < last_old.angle - first_new.angle < 180:
+        raise ValueError('Input lacks the expected encoder phases for the boundary-loss check')
+    with rclpy.init():
+        results = [run_pipeline(impl, config, parts, sentinel)[0] for impl in ('cpp', 'python')]
+    compare(*results)
+    n_old, n_new = map(len, parts)
+    print(f'Omitted {2 * count - n_old - n_new} recorded spokes around encoder zero. '
+          f'Both implementations emitted separate {n_old}- and {n_new}-row sweeps.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bag')
-    parser.add_argument('--rotations', type=int, default=20)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--rotations', type=int, default=20)
+    mode.add_argument('--check-boundary-loss', action='store_true',
+                      help='Test loss of a burst across encoder zero on two recorded revolutions')
     args = parser.parse_args()
+    if args.check_boundary_loss:
+        check_boundary_loss(args.bag)
+        return
     if args.rotations < 1:
         parser.error('--rotations must be positive')
     inputs = recorded_input(args.bag, args.rotations)

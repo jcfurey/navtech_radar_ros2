@@ -144,7 +144,7 @@ def test_configuration_transition_flushes_using_old_geometry(make_node):
     old = node._sweep_publisher.messages[1]
     assert old.configuration_version == 1
     assert old.range_resolution == 0.5
-    assert node._last_angle is None
+    assert not node._spokes
     assert node._range_resolution == 1.0
 
 
@@ -154,7 +154,7 @@ def test_repeated_configuration_does_not_split_sweep(make_node):
     node._spoke_callback(spoke(180, version=1))
     node._configuration_callback(configuration())
     assert len(node._spokes) == 1
-    assert node._last_angle == math.pi
+    assert node._spokes[-1].angle == math.pi
 
 
 def test_cross_topic_reordering_never_uses_wrong_configuration(make_node):
@@ -215,7 +215,7 @@ def test_invalid_8bit_payload_does_not_finish_pending_sweep(make_node):
     node._spoke_callback(spoke(270))
     node._spoke_callback(spoke(0, bits=8, values=[0, 256, 0]))
     assert len(node._spokes) == 2
-    assert node._last_angle == 3 * math.pi / 2
+    assert node._spokes[-1].angle == 3 * math.pi / 2
     assert not node._sweep_publisher.messages
     assert node._invalid_spokes == 1
 
@@ -573,3 +573,38 @@ def test_unknown_rate_uses_fallback_gap(make_node):
     for az, sec in [(0, 1), (90, 3), (180, 12), (270, 13), (0, 14)]:
         node._spoke_callback(spoke(az, stamp=sec))
     assert [list(s.encoder_values) for s in node._sweep_publisher.messages] == [[180, 270]]
+
+
+@pytest.mark.parametrize('encoder,advance,gap_ns,boundary', [
+    (90, 3, 187500000, True),     # 180 -> 90 across zero, three packets onward
+    (180, 4, 249000000, True),    # same bearing one slightly fast turn later
+    (90, 0, 187500000, False),    # absent or repeated counter
+    (90, 1, 187500000, False),    # position and counter disagree
+    (90, 3, 1000000, False),      # elapsed sensor time contradicts a wrap
+    (45, 3, 156250000, False),    # exactly half a cell from the predicted bearing
+    (225, 1, 62500000, False),    # ordinary forward motion
+    (180, 0, 0, False),           # duplicate spoke stays in the same sweep
+])
+def test_counter_evidence_for_wrap(make_node, encoder, advance, gap_ns, boundary):
+    node = make_node()
+    cfg = configuration()
+    cfg.expected_rotation_rate = 4
+    node._configuration_callback(cfg)
+    node._spoke_callback(spoke(90, counter=65533, version=1))
+    node._spoke_callback(spoke(180, counter=65534, version=1))
+    source = spoke(encoder, counter=(65534 + advance) % 65536, version=1)
+    source.header.stamp.nanosec = gap_ns
+    node._spoke_callback(source)
+    assert bool(node._sweep_publisher.messages) == boundary
+    assert len(node._spokes) == (1 if boundary else 3)
+
+
+def test_hidden_wrap_closes_a_complete_sweep_in_strict_mode(make_node):
+    node = make_node(publish_partial_sweeps=False)
+    node._configuration_callback(configuration())
+    # Dropping the first two rays of turn two leaves only a 90-degree
+    # backwards jump. Strict mode should still publish the complete first turn.
+    for tick in (0, 1, 2, 3, 6, 7, 8):
+        node._spoke_callback(spoke(90 * (tick % 4), counter=tick, version=1))
+    assert len(node._sweep_publisher.messages) == 1
+    assert list(node._sweep_publisher.messages[0].sweep_counters) == [0, 1, 2, 3]

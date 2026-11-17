@@ -267,6 +267,14 @@ within half an encoder tick across the 0° wrap. Derived products then use the
 encoder bearing. Before configuration, the assembler uses the supplied angle
 and requires distinct raw encoder counts for a complete sweep.
 
+A large backwards angle step closes a revolution. Packet loss around encoder
+zero can leave a smaller step. With a configuration, the assembler also checks
+whether the 16-bit FFT packet counter advanced by the number of angular cells
+for one crossing of zero (within half a cell). When the rotation rate and both
+sensor timestamps are available, the elapsed time must also support that crossing.
+This allows the two partial sweeps to be published separately or evaluated
+individually in strict mode. The counter wraps at 65,536. [Navtech FFT packet format](https://navtechradar.atlassian.net/wiki/spaces/IA/pages/2061009217)
+
 A backward sensor timestamp or a forward gap of at least one configured
 revolution discards the pending sweep and begins a new one at the incoming
 spoke. When rotation rate is unknown, the fallback boundary is a gap longer

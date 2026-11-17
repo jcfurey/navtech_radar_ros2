@@ -125,7 +125,6 @@ class FftSweepAssembler(Node):
         self._sample_bit_depth = None
         self._configuration_frame = None
         self._rotation_rate = 0
-        self._last_angle = None
         self._spokes: list[StoredSpoke] = []
         self._sweep_sequence = 0
         self._dropped_sweeps = 0
@@ -271,6 +270,26 @@ class FftSweepAssembler(Node):
             f'{self._range_resolution:.6f} m/bin'
         )
 
+    def _crossed_zero(self, previous, message, angle, gap_ns):
+        if angle < previous.angle - self._wrap_threshold:
+            return True
+        if self._encoder_size is None:
+            return False
+
+        steps = (message.sweep_counter - previous.sweep_counter) % 65536
+        if steps == 0 or (message.azimuth >= previous.azimuth and steps < self._expected_spokes):
+            return False
+
+        # How many nominal cells would a forward path crossing zero traverse?
+        ticks = self._encoder_size + message.azimuth - previous.azimuth
+        cells = ticks * self._expected_spokes / self._encoder_size
+        if abs(cells - steps) >= 0.5:
+            return False
+        if (not self._rotation_rate or (previous.stamp.sec, previous.stamp.nanosec) == (0, 0)
+                or (message.header.stamp.sec, message.header.stamp.nanosec) == (0, 0)):
+            return True
+        return abs(gap_ns * 1e-9 * self._rotation_rate - ticks / self._encoder_size) < 0.5
+
     def _spoke_callback(self, message: FftSpoke) -> None:
         angle = float(message.azimuth_angle)
         if (
@@ -327,13 +346,9 @@ class FftSweepAssembler(Node):
                 len(message.data) != previous.values.size
                 or message.sample_bit_depth != previous.sample_bit_depth
                 or message.header.frame_id != previous.frame_id
+                or self._crossed_zero(previous, message, angle, gap_ns)
             ):
                 self._finish_sweep()
-        if (
-            self._last_angle is not None
-            and angle < self._last_angle - self._wrap_threshold
-        ):
-            self._finish_sweep()
 
         if len(self._spokes) >= self._max_buffered_spokes:
             self.get_logger().warning(
@@ -353,7 +368,6 @@ class FftSweepAssembler(Node):
             frame_id=message.header.frame_id,
             values=values,
         ))
-        self._last_angle = angle
 
     def _reject_spoke(self, reason: str) -> None:
         self._invalid_spokes += 1
@@ -363,12 +377,10 @@ class FftSweepAssembler(Node):
         if self._spokes:
             self._dropped_sweeps += 1
         self._spokes = []
-        self._last_angle = None
 
     def _finish_sweep(self) -> None:
         spokes = self._spokes
         self._spokes = []
-        self._last_angle = None
         if not spokes:
             return
         if len(spokes) < self._minimum_spokes:

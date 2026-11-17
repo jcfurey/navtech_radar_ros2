@@ -269,3 +269,23 @@ Both installed implementations agreed with those positions. The largest C++
 coordinate residual was below 4 µm against the same recorded poses. This
 measures numerical agreement with the TF trajectory. Absolute mapping accuracy
 also depends on the radar mount, timestamps, odometry and motion of reflectors.
+
+## Packet loss across encoder zero
+
+In the April 2024 route 1/run 2 recording, the check keeps the first 201
+spokes of one complete turn and the last 300 of the next. It deliberately
+removes the intervening 299 spokes. The encoder goes from 180.836° to 90.836°
+across a 187.574 ms gap and the packet counter advances by 300. The default
+180° wrap detector previously combined both groups into a 501-row sweep
+spanning 0.499 s. Both corrected assemblers emitted separate 201-row and
+300-row sweeps, with every retained FFT row matching its original spoke.
+
+From the driver checkout with its ROS workspace sourced, replay this case through
+the installed C++ and Python nodes. The check compares each sweep's row bytes,
+counters, encoders and timestamps against its retained input group. It also
+compares the two implementations' scan and cloud outputs.
+
+```bash
+ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+  python3 tools/compare_playback.py /path/to/ros2_mcap --check-boundary-loss
+```
