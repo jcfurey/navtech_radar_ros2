@@ -19,7 +19,7 @@ The playback executables build and run independently of the submodule.
 
 ## Dataset and legacy ROS messages
 
-The Texas A&M Unmanned Systems Lab and its collaborators collected and published
+Texas A&M University and the DEVCOM Army Research Laboratory collaborated on
 [The Great Outdoors Dataset](https://github.com/unmannedlab/the-great-outdoors-dataset).
 The recording, radar configuration, legacy message schemas, and inputs to the
 recorded-data previews and measurements come from this work. The packaged
@@ -37,6 +37,7 @@ repository implement the same ROS contracts as the Python reference here.
 - [norlab-ulaval/navtech_radar_ros](https://github.com/norlab-ulaval/navtech_radar_ros) documents an earlier ROS 2 integration.
 - [biomotion/navtech_projection](https://github.com/biomotion/navtech_projection) illustrates polar-to-Cartesian radar image projection.
 - [utiasASRL/steam_icp](https://github.com/utiasASRL/steam_icp) provides a downstream radar odometry reference.
+- [KKonaOG/LWLRF](https://github.com/KKonaOG/LWLRF/blob/9a9e9e452efe2198658839e2854481f06737c73b/launch/lwlrf.launch) supplied the provisional radar mounting parameters used in the TAMU visualization. The [mounting notes](docs/playback_validation.md#planar-mounting-correction-2026-10-01) describe the roll correction.
 
 The pipeline uses the [ROS 2 middleware and message interfaces](https://docs.ros.org/en/lyrical/),
 [NumPy](https://numpy.org/doc/stable/) and [OpenCV](https://docs.opencv.org/4.x/).
