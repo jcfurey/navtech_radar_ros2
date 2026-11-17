@@ -1,17 +1,21 @@
 """Test display geometry and contrast without modifying the canonical FFT data."""
 
 from array import array
+from contextlib import ExitStack
 from copy import deepcopy
 import math
 
+from compare_images import ImageComparison
 from fft_sweep_visualizer import FftSweepVisualizer, planar_yaw, SweepRenderer
 from geometry_msgs.msg import Quaternion, TransformStamped
 from navtech_radar_msgs.msg import FftSweep, RadarConfiguration
 import numpy as np
 import pytest
+import rclpy
 from rclpy.context import Context
 from rclpy.parameter import Parameter
 from rclpy.serialization import deserialize_message, serialize_message
+from tf2_ros import TransformBroadcaster
 
 
 def fixture_messages(values, encoders=None, *, bigendian=False, padding=0):
@@ -255,3 +259,64 @@ def test_tf_heading_uses_sweep_stamp_and_does_not_reuse_missing_transform():
     finally:
         node.destroy_node()
         context.try_shutdown()
+
+
+@pytest.mark.parametrize('view', ['polar', 'cartesian'])
+def test_installed_visualizers_partial_padded_sweeps(view):
+    parameters = ['annotate:=false', 'min_range:=0.75', 'max_range:=125.0', 'image_width:=64',
+                  'cartesian_size:=151', 'gamma:=0.65', 'azimuth_offset_degrees:=17.0']
+    rng = np.random.default_rng(180)
+    values = rng.integers(0, 65536, (4, 272), dtype=np.uint16)
+    encoders = [0, 0, 45, 270]  # Two duplicate rows and a half-cell tie.
+    sweep, config = fixture_messages(values, encoders, bigendian=True, padding=6)
+    with rclpy.init(), ExitStack() as cleanup:
+        check = ImageComparison(cleanup, parameters, views=(view,))
+        check.configs.publish(config)
+        check.frame(sweep, warmup=True)
+        for version, stamp, divisor in [(1, 11, 3), (1, 7, 5), (2, 12, 2)]:
+            sweep, _ = fixture_messages(values // divisor, encoders, bigendian=True, padding=6)
+            sweep.configuration_version = version
+            sweep.header.stamp.sec = stamp
+            if version != config.configuration_version:
+                config.configuration_version = version
+                check.configs.publish(config)
+            check.frame(sweep, warmup=(version == 2))
+
+
+def test_installed_visualizers_use_interpolated_tf_and_clear_missing_heading():
+    frame = 'radar'
+    robot = 'renderer_test_vehicle'
+    sweep, config = fixture_messages(np.arange(4 * 601).reshape(4, 601))
+    with rclpy.init(), ExitStack() as cleanup:
+        check = ImageComparison(cleanup, [f'robot_frame:={robot}', 'heading_frame:=' + frame])
+        broadcaster = TransformBroadcaster(check.node)
+        transforms = []
+        for sec, yaw in [(10, 0.0), (12, math.pi / 2)]:
+            tf = TransformStamped()
+            tf.header.frame_id = frame
+            tf.header.stamp.sec = sec
+            tf.child_frame_id = robot
+            tf.transform.rotation.z = math.sin(yaw / 2)
+            tf.transform.rotation.w = math.cos(yaw / 2)
+            transforms.append(tf)
+        check.configs.publish(config)
+        sweep.header.stamp.sec = 11
+        yaw = math.pi / 4
+        oracle = SweepRenderer()
+        polar, plan = oracle.render(sweep, config, robot_bearing=yaw, heading=(yaw, frame))
+        expected = {'polar': polar.tobytes(), 'cartesian': plan.tobytes()}
+
+        def heading_received(outputs):
+            if all(msg.data.tobytes() == expected[view] for (_, view), msg in outputs.items()):
+                return True
+            broadcaster.sendTransform(transforms)
+            return False
+
+        broadcaster.sendTransform(transforms)
+        check.frame(sweep, warmup=True, ready=heading_received)
+        # Both buffered transforms are in the future at this acquisition time.
+        sweep.header.stamp.sec = 5
+        images = check.frame(sweep)
+        polar, plan = oracle.render(sweep, config)
+        assert images['polar'].data.tobytes() == polar.tobytes()
+        assert images['cartesian'].data.tobytes() == plan.tobytes()

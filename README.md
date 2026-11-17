@@ -8,8 +8,9 @@ Dataset.
 
 The C++ adapter and sweep assembler process the CTS350-X's 16-bit FFT stream.
 They produce raw spokes, sweeps and images, with optional adaptive peak selection,
-planar point clouds and laser scans. The enhanced image renderer uses Python,
-NumPy and OpenCV. Live radar transport is still planned.
+planar point clouds and laser scans. The C++ visualizer renders the polar and
+Cartesian displays with OpenCV and uses TF for timestamped vehicle headings.
+Live radar transport is still planned.
 
 This checkout contains all four ROS packages, including the legacy `nav_ross`
 interfaces. Start with a ROS 2 Lyrical installation, colcon, a C++17 compiler,
@@ -65,7 +66,10 @@ topics without changing the source bag:
 /navtech_radar/scan          sensor_msgs/LaserScan (optional, lossy)
 ```
 
-The installed executables `legacy_bag_driver` and `fft_sweep_assembler` are C++. The Python reference executables have the suffix `_py`. Both implementations accept the same ROS parameters, topic remaps and QoS settings.
+The installed executables `legacy_bag_driver`, `fft_sweep_assembler` and
+`fft_sweep_visualizer` are C++. Each has a Python reference executable with the
+suffix `_py`. The launch argument `implementation:=python` selects all three
+references. Both implementations accept the same ROS parameters and topic remaps.
 
 ## Enhanced images
 
@@ -98,7 +102,7 @@ These are lossy visualization products. `FftSweep`, `FftSpoke`, and the original
 contains no elevation measurement. The visualizer requires a matching nonzero
 configuration version and supports up to 2048 azimuth rows and 16384 range bins.
 Image publishers and the sweep subscription use reliable, volatile QoS, depth 1.
-Rendering is skipped when neither output has subscribers.
+The native visualizer renders each view only when that view has subscribers.
 
 ```bash
 ros2 run navtech_radar_processing fft_sweep_visualizer --ros-args \
@@ -250,11 +254,17 @@ The benchmark preloads the same input spokes and waits for each revolution's
 outputs. Reader, viewer and comparison-process CPU are outside these figures.
 See the [measurement details](docs/playback_validation.md#native-playback-comparison).
 
-Run the same comparison on Linux from a sourced build:
+In a separate comparison on the same 32 revolutions, the visualizer alone used
+1.60 s of CPU in C++ and 2.68 s in Python. Both annotated BGR8 views matched
+byte-for-byte. [Image comparison details](docs/playback_validation.md#native-image-comparison)
+
+Run either comparison on Linux from a sourced build.
 
 ```bash
 ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
   python3 src/navtech_radar_ros2/tools/compare_playback.py /path/to/ros2_mcap --rotations 32
+ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+  python3 src/navtech_radar_ros2/tools/compare_images.py /path/to/ros2_mcap --rotations 32
 ```
 
 The registered tests also exercise both installed implementations with a small

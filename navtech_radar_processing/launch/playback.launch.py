@@ -24,7 +24,7 @@ def start(context):
                  'peak_selection': LaunchConfiguration('peak_selection'),
                  'scan_selection': LaunchConfiguration('scan_selection'),
              }]),
-        Node(package='navtech_radar_processing', executable='fft_sweep_visualizer',
+        Node(package='navtech_radar_processing', executable='fft_sweep_visualizer' + suffix,
              parameters=[common, {'robot_frame': ParameterValue(LaunchConfiguration('robot_frame'), value_type=str),
                                   'heading_frame': ParameterValue(LaunchConfiguration('heading_frame'), value_type=str)}]),
         Node(package='rviz2', executable='rviz2', condition=IfCondition(LaunchConfiguration('rviz')),

@@ -195,3 +195,22 @@ and `colcon test-result` reported zero failures. Running the installed
 `playback.launch.py` on the same MCAP delivered five 400-ray scans, five
 nonempty XYZI clouds and five 800 × 800 Cartesian images to a headless DDS
 subscriber. All three products used the `navtech` frame.
+
+## Native image comparison
+
+The [image comparison script](../tools/compare_images.py) feeds the installed C++
+and Python visualizers identical sweeps from the route 1/run 2 recording. On
+ROS 2 Lyrical, both produced identical headers, dimensions, encodings, strides
+and pixel bytes for the annotated polar and Cartesian views on 32 full revolutions.
+With the default display settings, the C++ visualizer used 1.60 s of process CPU
+and the Python visualizer used 2.68 s. Each process had subscribers for both
+views. Measurement started after an initial partial sweep warmed the projection
+cache. Bag decoding, sweep assembly, the comparison process and RViz were
+outside the measurement. The replay used empty heading frame parameters.
+
+The installed-executable tests also compare single-view subscribers, padded
+big-endian samples, azimuth offsets, duplicate and missing rows, cropped range
+pooling, contrast history across rewinds and configuration changes, and gamma.
+A timestamped TF fixture checks the arrow and heading text against an interpolated
+45-degree vehicle yaw, then seeks before the transform history and checks the
+unavailable-heading display.
