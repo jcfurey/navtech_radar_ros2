@@ -42,6 +42,8 @@ install(PROGRAMS
   RENAME fft_sweep_visualizer_py
 )
 
+install(FILES scripts/radar_geometry.py DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE)
 

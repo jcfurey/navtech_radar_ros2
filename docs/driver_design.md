@@ -97,7 +97,7 @@ uint16 azimuth_samples
 uint16 encoder_size
 uint16 bin_size                        # exact Colossus configuration field
 uint16 range_bins
-float64 range_resolution               # metres per bin
+float64 range_resolution               # nominal metres per bin
 uint16 expected_rotation_rate          # revolutions per second
 uint16 packet_rate                     # spokes per second, when available
 float32 range_gain
@@ -114,10 +114,15 @@ uint32 ntp_seconds                     # exact wire timestamp fields
 uint32 ntp_split_seconds
 uint16 sweep_counter
 uint16 azimuth                         # encoder count, not a row index
-float64 azimuth_angle                  # derived radians, before mount offset
+float64 azimuth_angle                  # native clockwise radians
 uint8 sample_bit_depth
 uint16[] data                          # exact high-precision FFT bins
 ```
+
+Range calibration uses zero-based FFT bin indices. The processing packages
+apply the configured gain to the nominal bin spacing and add the offset in
+metres. The legacy adapter supplies unit gain and zero offset because its
+configuration message omits those fields. [Navtech Colossus configuration](https://navtechradar.atlassian.net/wiki/spaces/IA/pages/2061009217)
 
 Keeping both the converted sensor timestamp and original timestamp fields
 avoids losing information if firmware variants interpret the split-second

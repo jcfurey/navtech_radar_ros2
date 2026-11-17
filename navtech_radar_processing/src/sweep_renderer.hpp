@@ -10,6 +10,7 @@
 
 #include "navtech_radar_msgs/msg/fft_sweep.hpp"
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
+#include "radar_geometry.hpp"
 #include <opencv2/core.hpp>
 
 namespace radar {
@@ -41,17 +42,18 @@ private:
   void update_colors(const cv::Mat1w &grid, const std::vector<bool> &present,
                      const Sweep &sweep, const Config &config);
   void update_projection(int rows, int cols, int first, int stride,
-                         double resolution, double extent);
+                         const RangeAxis &range, double extent);
   DisplaySettings settings_;
   double offset_;
   cv::Mat3b palette_;
   std::array<uint32_t, 65536> histogram_{};
   std::array<cv::Vec3b, 65536> colors_{};
-  using Geometry = std::tuple<uint32_t, std::string, int, int, int, double>;
+  using Geometry =
+      std::tuple<uint32_t, std::string, int, int, int, double, double, double>;
   std::optional<Geometry> epoch_;
   int64_t stamp_{};
   double low_{}, high_{};
-  using Projection = std::tuple<int, int, int, int, double, double>;
+  using Projection = std::tuple<int, int, int, int, double, double, double>;
   std::optional<Projection> projection_;
   cv::Mat1i indices_;
 };

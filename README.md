@@ -81,7 +81,7 @@ and its configuration and publishes two `bgr8` display images:
   ticks, +x up and +y left. Both images show coverage, missing/duplicate bearings,
   frame name and scan rate. TF supplies a cyan vehicle-forward marker and vehicle
   yaw in the requested reference frame at the sweep's acquisition timestamp.
-  If that transform is unavailable, yaw is labeled unavailable.
+  A missing transform or zero acquisition timestamp gives an unavailable heading.
 
 Set `robot_frame` and `heading_frame` to enable the TF overlays; the TAMU launch
 sets `lester/base` and `lester/map`. Yaw is counterclockwise around reference +z
@@ -115,9 +115,12 @@ and `annotate` (true). Gamma below 1 brightens weaker returns. The playback
 workspace starts this node and configures RViz automatically. Its
 `radar_images:=false` launch option returns to the raw image display.
 
-`azimuth_offset_degrees` rotates the derived Cartesian projection and polar
-bearing labels. The TAMU launch shares this value with cloud and scan conversion.
-The raw encoder grid and all canonical messages remain unchanged.
+On the TAMU installation, the native encoder advances clockwise as viewed from
+above. With ROS +x up and +y left, a native 90° return appears on the right at
+zero yaw offset. Both displays, the point cloud and the scan use the same
+bearing, `azimuth_offset_degrees − native_angle_degrees`. The polar image keeps
+the encoder rows in order and labels them with their ROS bearings. The sign was
+checked against a nearly stationary vehicle turn. [Recorded turn validation](docs/playback_validation.md#bearing-and-range-validation)
 
 ![Recorded FFT sweep before and after display processing](docs/fft_display_comparison.png)
 
@@ -147,21 +150,27 @@ cloud budget is applied; `strongest` instead chooses the largest FFT level.
 Thus a scan is useful for a compact planar view, while the cloud retains
 multiple reflectors along a bearing.
 
-The scan has the configured number of bearings, positive angle increment, and
-no duplicated 360° endpoint. Its first angle is the first acquired spoke's
-bearing, including the derived azimuth offset, and its header is that spoke's
-sensor timestamp. Initial partial sweeps therefore may start at a nonzero angle;
-`angle_max` may exceed 2π. Missing bearings are `NaN`; observed bearings with no
-selected return are `+inf`, with intensity 0. Off-grid rays farther than a
-quarter angular cell are omitted instead of interpolated into gaps. Duplicate
-bearings use the selected nearest/strongest policy.
+The scan keeps clockwise acquisition order. For `N` bearings,
+`angle_increment = −2π/N`, `angle_min` is the first acquired bearing in [0, 2π),
+and `angle_max = angle_min + (N−1) × angle_increment`. The header carries the
+first spoke's sensor timestamp. Consumers must support a negative angular
+increment. Missing bearings and observed bearings with no accepted detection
+both carry `NaN` with zero intensity. Use the sweep's encoder list to distinguish
+the two cases. A missing peak leaves occupancy unknown. Off-grid rays farther
+than a quarter of a cell are omitted. Duplicate bearings use the configured
+nearest/strongest policy. [ROS LaserScan message](https://docs.ros.org/en/lyrical/p/sensor_msgs/msg/LaserScan.html)
+
+Range gates, peak separation, scan ranges, cloud positions and display scales
+use the configured metric axis. For zero-based bin `i`, the range in metres is
+`i × range_resolution × range_gain + range_offset`. The TAMU recording omits
+the calibration coefficients, so its adapter supplies gain 1 and offset 0.
+Older canonical configurations with both fields zero also use this identity.
+`FftSweep.range_resolution` carries the nominal spacing. [Navtech Colossus configuration](https://navtechradar.atlassian.net/wiki/spaces/IA/pages/2061009217)
 
 `scan_time` comes from the configured rotation period. `time_increment` is
 nonzero only when per-spoke timestamps agree with that uniform acquisition
 schedule within 10% of a cell period (at least 1 µs), without duplicates or
-off-grid rays. Otherwise it is 0, representing a snapshot. This conversion is
-lossy radar detection data: a missing detection is not evidence of free space,
-and LaserScan consumers can make assumptions specific to laser sensing.
+off-grid rays. Otherwise it is 0, representing a snapshot. The finite ranges describe the selected radar reflections.
 
 ```bash
 ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap rviz:=true
@@ -246,7 +255,7 @@ at startup.
 ## Performance and verification
 
 On 32 full revolutions of the April 2024 TAMU recording, the C++ adapter and
-assembler together used 4.11 s of CPU versus 11.31 s for the Python nodes in
+assembler together used 4.16 s of CPU versus 11.20 s for the Python nodes in
 one Release-build run. Both pipelines had subscribers for the raw sweep,
 raw image, CFAR cloud and nearest-return scan. The comparison checks every raw
 image row, sweep metadata, scan fields, and cloud geometry and intensities.
@@ -255,7 +264,7 @@ outputs. Reader, viewer and comparison-process CPU are outside these figures.
 See the [measurement details](docs/playback_validation.md#native-playback-comparison).
 
 In a separate comparison on the same 32 revolutions, the visualizer alone used
-1.60 s of CPU in C++ and 2.68 s in Python. Both annotated BGR8 views matched
+1.49 s of CPU in C++ and 2.51 s in Python. Both annotated BGR8 views matched
 byte-for-byte. [Image comparison details](docs/playback_validation.md#native-image-comparison)
 
 Run either comparison on Linux from a sourced build.

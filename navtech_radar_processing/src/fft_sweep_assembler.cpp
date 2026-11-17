@@ -20,6 +20,7 @@ public:
   SweepAssembler() : Node("navtech_fft_sweep_assembler") {
     frame_ = param<std::string>("output_frame", "");
     resolution_ = param("range_resolution", 0.0438);
+    axis_ = {resolution_, 0};
     count_ = param("expected_spokes", 400);
     partial_ = param("publish_partial_sweeps", true);
     minimum_ = param("minimum_spokes", 2);
@@ -95,7 +96,9 @@ private:
   }
 
   void configure(Config::ConstSharedPtr c) {
-    if (!valid_frame(c->header.frame_id) || !c->configuration_version ||
+    const auto axis = RangeAxis::from_config(*c);
+    if (!axis.valid(c->range_bins) || !valid_frame(c->header.frame_id) ||
+        !c->configuration_version ||
         !(std::isfinite(c->range_resolution) && c->range_resolution > 0) ||
         !c->azimuth_samples || c->azimuth_samples > c->encoder_size ||
         c->azimuth_samples > max_rows_ || !c->range_bins ||
@@ -109,12 +112,14 @@ private:
       return std::tie(msg.configuration_version, msg.range_resolution,
                       msg.azimuth_samples, msg.encoder_size, msg.range_bins,
                       msg.sample_bit_depth, msg.header.frame_id,
-                      msg.expected_rotation_rate);
+                      msg.expected_rotation_rate, msg.range_gain,
+                      msg.range_offset);
     };
     if (config_ && geometry(*config_) == geometry(*c))
       return;
     finish();
     config_ = std::move(c);
+    axis_ = axis;
     resolution_ = config_->range_resolution;
     count_ = config_->azimuth_samples;
   }
@@ -231,7 +236,7 @@ private:
     std::optional<ScanBuilder> scan;
     std::optional<Cloud> cloud;
     if (publish_scan_ && scans_->get_subscription_count())
-      scan.emplace(first, count_, resolution_,
+      scan.emplace(first, count_, axis_,
                    config_ ? config_->expected_rotation_rate : 0, offset_,
                    settings_);
     if (publish_cloud_ && clouds_->get_subscription_count())
@@ -239,12 +244,12 @@ private:
     if (!scan && !cloud)
       return;
     for (const auto &s : pending_) {
-      const auto &bins = detector_.select(s->data, resolution_, settings_);
+      const auto &bins = detector_.select(s->data, axis_, settings_);
       if (scan)
-        scan->add(*s, bins, resolution_, settings_.nearest);
+        scan->add(*s, bins, axis_, settings_.nearest);
       if (cloud)
-        append_points(*cloud, *s, bins, resolution_, offset_,
-                      settings_.cloud_limit, cloud_bins_);
+        append_points(*cloud, *s, bins, axis_, offset_, settings_.cloud_limit,
+                      cloud_bins_);
     }
     if (cloud)
       clouds_->publish(*cloud);
@@ -261,6 +266,7 @@ private:
   bool partial_, publish_cloud_, publish_scan_;
   uint32_t sequence_{};
   DetectionSettings settings_;
+  RangeAxis axis_;
   PeakDetector detector_;
   std::vector<int> cloud_bins_;
   Config::ConstSharedPtr config_;

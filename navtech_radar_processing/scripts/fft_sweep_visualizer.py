@@ -7,6 +7,7 @@ import math
 import cv2
 from navtech_radar_msgs.msg import FftSweep, RadarConfiguration
 import numpy as np
+from radar_geometry import RangeAxis
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -74,7 +75,8 @@ class SweepRenderer:
     @staticmethod
     def validate_configuration(config):
         if (
-            config.configuration_version == 0
+            not RangeAxis.from_config(config).valid(config.range_bins)
+            or config.configuration_version == 0
             or not 0 < config.azimuth_samples <= min(2048, config.encoder_size)
             or not 0 < config.range_bins <= 16384
             or not math.isfinite(config.range_resolution) or config.range_resolution <= 0
@@ -99,12 +101,8 @@ class SweepRenderer:
         ):
             raise ValueError('Sweep image or encoder metadata does not match configuration')
 
-        resolution = sweep.range_resolution
-        # Clamp before conversion to int, including extreme but finite resolutions.
-        first = int(math.ceil(min(self.min_range / resolution, image.width)))
-        last = min(image.width, int(math.floor(min(
-            self.max_range / resolution, image.width
-        ))) + 1)
+        range_axis = RangeAxis.from_config(config)
+        first, last = range_axis.window(image.width, self.min_range, self.max_range)
         if first >= last:
             raise ValueError('Display range does not overlap the FFT bins')
         pixels = np.ndarray(
@@ -126,8 +124,8 @@ class SweepRenderer:
         present = np.zeros(config.azimuth_samples, dtype=bool)
         present[row_indices] = True
 
-        epoch = (config.configuration_version, config.header.frame_id,
-                 config.encoder_size, config.azimuth_samples, image.width, resolution)
+        epoch = (config.configuration_version, config.header.frame_id, config.encoder_size,
+                 config.azimuth_samples, image.width, sweep.range_resolution, range_axis)
         stamp = (sweep.header.stamp.sec, sweep.header.stamp.nanosec)
         if epoch != self._epoch or (self._stamp is not None and stamp < self._stamp):
             self._bounds = None
@@ -142,18 +140,18 @@ class SweepRenderer:
         scaled[~present] = 0
         polar = self._colors[scaled]
 
-        extent = min(self.max_range, (image.width - 1) * resolution)
-        key = (grid.shape, first, last, stride, resolution, extent)
+        extent = min(self.max_range, range_axis.metres(image.width - 1))
+        key = (grid.shape, first, last, stride, range_axis, extent)
         if key != self._map_key:
             self._map_key = key
             center = (self.cartesian_size - 1) / 2
             axis = (center - np.arange(self.cartesian_size)) * extent / center
             x, y = np.meshgrid(axis, axis, indexing='ij')
             ranges = np.hypot(x, y)
-            angles = (np.arctan2(y, x) - self.azimuth_offset) % (2 * math.pi)
+            angles = (self.azimuth_offset - np.arctan2(y, x)) % (2 * math.pi)
             rows = np.rint(angles * grid.shape[0] / (2 * math.pi)).astype(np.int32)
             rows %= grid.shape[0]
-            columns = np.floor((ranges / resolution - first) / stride)
+            columns = np.floor(((ranges - range_axis.offset) / range_axis.spacing - first) / stride)
             valid = (ranges >= self.min_range) & (ranges <= extent) & (columns >= 0)
             # Clipping before the cast also handles extremely small resolutions.
             columns = np.clip(columns, 0, grid.shape[1] - 1).astype(np.int32)
@@ -165,7 +163,7 @@ class SweepRenderer:
             coverage = (int(present.sum()), config.azimuth_samples,
                         image.height - len(set(sweep.encoder_values)))
             polar = self._annotate_polar(
-                polar, first * resolution, (last - 1) * resolution,
+                polar, range_axis.metres(first), range_axis.metres(last - 1),
                 sweep, config, coverage, robot_bearing, heading,
             )
             self._annotate_cartesian(
@@ -195,10 +193,10 @@ class SweepRenderer:
         self._text(result, self._heading_text(heading), (48, 40))
         for encoder_angle in (0, 90, 180, 270):
             row = 52 + round(encoder_angle * height / 360)
-            angle = (encoder_angle + math.degrees(self.azimuth_offset)) % 360
+            angle = (math.degrees(self.azimuth_offset) - encoder_angle) % 360
             self._text(result, f'{angle:.0f}', (5, row + 5))
         if robot_bearing is not None:
-            angle = (robot_bearing - self.azimuth_offset) % (2 * math.pi)
+            angle = (self.azimuth_offset - robot_bearing) % (2 * math.pi)
             row = 52 + round(angle * height / (2 * math.pi)) % height
             cv2.line(result, (48, row), (width + 47, row), (255, 220, 0), 1)
             self._text(result, 'vehicle forward', (54, min(row + 16, height + 48)))
@@ -213,7 +211,7 @@ class SweepRenderer:
         self._text(result, f'Sweep {sweep.sweep_sequence} | {observed}/{total} bearings | '
                    f'{total - observed} missing | {duplicates} duplicates', (48, height + 112))
         self._text(result, f'{config.expected_rotation_rate} Hz | '
-                   f'{sweep.range_resolution * 100:.2f} cm/bin | raw FFT levels',
+                   f'{RangeAxis.from_config(config).spacing * 100:.2f} cm/bin | raw FFT levels',
                    (48, height + 134))
         return result
 
@@ -332,7 +330,7 @@ class FftSweepVisualizer(Node):
                 publisher.publish(output)
 
     def _lookup_yaw(self, target, stamp):
-        if not self._robot_frame or not target:
+        if not self._robot_frame or not target or (stamp.sec == 0 and stamp.nanosec == 0):
             return None
         # Use the sweep acquisition time; latest TF can belong to a different
         # pose after a bag seek or while display processing is behind playback.

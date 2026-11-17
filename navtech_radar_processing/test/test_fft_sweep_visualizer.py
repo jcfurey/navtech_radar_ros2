@@ -58,9 +58,9 @@ def test_plan_view_cardinal_axes_and_raw_data_preserved():
     render = renderer()
     polar, plan = render.render(sweep, config)
     np.testing.assert_array_equal(plan[12, 32], render._colors[64])  # +x: up
-    np.testing.assert_array_equal(plan[32, 12], render._colors[128])  # +y: left
+    np.testing.assert_array_equal(plan[32, 12], render._colors[255])  # +y: left
     np.testing.assert_array_equal(plan[52, 32], render._colors[191])  # -x: down
-    np.testing.assert_array_equal(plan[32, 52], render._colors[255])  # -y: right
+    np.testing.assert_array_equal(plan[32, 52], render._colors[128])  # -y: right
     assert polar.shape == (4, 33, 3)
     assert plan.shape == (65, 65, 3)
     assert sweep == original
@@ -74,7 +74,7 @@ def test_missing_azimuths_are_black_and_duplicate_peaks_are_retained():
     polar, plan = render.render(sweep, config)
     np.testing.assert_array_equal(plan[12, 32], render._colors[255])
     assert not np.any(polar[3])
-    assert not np.any(plan[32, 52])
+    assert not np.any(plan[32, 12])
 
 
 def test_peak_pooling_preserves_narrow_returns():
@@ -204,7 +204,7 @@ def test_shared_azimuth_offset_rotates_only_derived_projection():
     render = renderer(azimuth_offset_degrees=90.0)
     polar, plan = render.render(sweep, config)
     np.testing.assert_array_equal(plan[32, 12], render._colors[64])
-    np.testing.assert_array_equal(plan[52, 32], render._colors[128])
+    np.testing.assert_array_equal(plan[12, 32], render._colors[128])
     np.testing.assert_array_equal(polar, original_polar)
     assert sweep == before
 
@@ -254,6 +254,8 @@ def test_tf_heading_uses_sweep_stamp_and_does_not_reuse_missing_transform():
         sweep.header.stamp.sec = 11
         assert node._lookup_yaw('map', sweep.header.stamp) == pytest.approx(math.pi / 4)
         assert node._lookup_yaw('missing', sweep.header.stamp) is None
+        sweep.header.stamp.sec = 0
+        assert node._lookup_yaw('map', sweep.header.stamp) is None
         sweep.header.stamp.sec = 1
         assert node._lookup_yaw('map', sweep.header.stamp) is None
     finally:
@@ -278,6 +280,7 @@ def test_installed_visualizers_partial_padded_sweeps(view):
             sweep.configuration_version = version
             sweep.header.stamp.sec = stamp
             if version != config.configuration_version:
+                config.range_gain, config.range_offset = 1.5, -0.25
                 config.configuration_version = version
                 check.configs.publish(config)
             check.frame(sweep, warmup=(version == 2))
@@ -314,9 +317,40 @@ def test_installed_visualizers_use_interpolated_tf_and_clear_missing_heading():
 
         broadcaster.sendTransform(transforms)
         check.frame(sweep, warmup=True, ready=heading_received)
-        # Both buffered transforms are in the future at this acquisition time.
-        sweep.header.stamp.sec = 5
-        images = check.frame(sweep)
-        polar, plan = oracle.render(sweep, config)
-        assert images['polar'].data.tobytes() == polar.tobytes()
-        assert images['cartesian'].data.tobytes() == plan.tobytes()
+        # Before TF history and at the TF "latest" sentinel, suppress both overlays.
+        for sec in (5, 0):
+            sweep.header.stamp.sec = sec
+            images = check.frame(sweep)
+            polar, plan = oracle.render(sweep, config)
+            assert images['polar'].data.tobytes() == polar.tobytes()
+            assert images['cartesian'].data.tobytes() == plan.tobytes()
+
+
+def test_calibrated_display_places_same_bin_at_new_metric_radius():
+    levels = np.zeros((4, 33), dtype=np.uint16)
+    levels[1, 10] = 500
+    sweep, cfg = fixture_messages(levels)
+    render = renderer()
+    _, before = render.render(sweep, cfg)
+    np.testing.assert_array_equal(before[32, 42], render._colors[255])  # 5 m right
+    cfg.range_gain, cfg.range_offset = 2.0, 2.0
+    polar, after = render.render(sweep, cfg)
+    assert polar.shape == (4, 15, 3)  # bins 0..14 span 2..16 m
+    np.testing.assert_array_equal(polar[1, 10], render._colors[255])
+    np.testing.assert_array_equal(after[32, 56], render._colors[255])  # 12 m right
+    assert not np.any(after[32, 42])
+
+
+def test_polar_ticks_and_vehicle_forward_use_clockwise_encoder_rows(monkeypatch):
+    labels = {}
+    monkeypatch.setattr(SweepRenderer, '_text', staticmethod(
+        lambda image, text, position, scale=0.45: labels.update({position: text})
+    ))
+    levels = np.zeros((4, 33), dtype=np.uint16)
+    sweep, cfg = fixture_messages(levels)
+    cfg.range_gain, cfg.range_offset = 2.0, 2.0
+    polar, _ = renderer(annotate=True).render(sweep, cfg, robot_bearing=math.pi / 2)
+    # Native rows 0/1/2/3 correspond to ROS 0/270/180/90 degrees.
+    assert [labels[(5, row)] for row in range(57, 61)] == ['0', '270', '180', '90']
+    np.testing.assert_array_equal(polar[55, 48], [255, 220, 0])
+    assert any('100.00 cm/bin' in label for label in labels.values())

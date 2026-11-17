@@ -7,6 +7,7 @@ import math
 
 from navtech_radar_msgs.msg import FftSpoke, FftSweep, RadarConfiguration
 import numpy as np
+from radar_geometry import RangeAxis, ros_bearing
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -77,6 +78,7 @@ class FftSweepAssembler(Node):
         self._range_resolution = float(
             self.get_parameter('range_resolution').value
         )
+        self._range_axis = RangeAxis(self._range_resolution, 0.0)
         self._expected_spokes = int(self.get_parameter('expected_spokes').value)
         self._publish_partial = bool(
             self.get_parameter('publish_partial_sweeps').value
@@ -211,8 +213,10 @@ class FftSweepAssembler(Node):
             raise ValueError('output_frame must have no leading slash')
 
     def _configuration_callback(self, message: RadarConfiguration) -> None:
+        axis = RangeAxis.from_config(message)
         if (
-            not math.isfinite(message.range_resolution)
+            not axis.valid(message.range_bins)
+            or not math.isfinite(message.range_resolution)
             or message.range_resolution <= 0
             or not 0 < message.azimuth_samples <= message.encoder_size
             or message.azimuth_samples > self._max_buffered_spokes
@@ -232,13 +236,14 @@ class FftSweepAssembler(Node):
             message.configuration_version, message.range_resolution,
             message.azimuth_samples, message.encoder_size, message.range_bins,
             message.sample_bit_depth, message.header.frame_id,
-            message.expected_rotation_rate,
+            message.expected_rotation_rate, message.range_gain, message.range_offset,
         )
         if key == self._configuration_key:
             return
         # Flush with the old geometry, including the version-zero fallback.
         self._finish_sweep()
         self._configuration_key = key
+        self._range_axis = axis
 
         self._configuration_version = int(message.configuration_version)
         self._range_resolution = float(message.range_resolution)
@@ -418,13 +423,8 @@ class FftSweepAssembler(Node):
         if values.size < 3 or self._range_resolution <= 0.0:
             return np.empty(0, dtype=np.int64)
 
-        first_bin = max(
-            1, int(math.ceil(min(self._min_range / self._range_resolution, values.size)))
-        )
-        last_bin = min(
-            values.size - 1,
-            int(math.floor(min(self._max_range / self._range_resolution, values.size))) + 1,
-        )
+        first, stop = self._range_axis.window(values.size, self._min_range, self._max_range)
+        first_bin, last_bin = max(1, first), min(values.size - 1, stop)
         if last_bin <= first_bin:
             return np.empty(0, dtype=np.int64)
 
@@ -449,7 +449,7 @@ class FftSweepAssembler(Node):
                 ranked = bins[np.argsort(-values[bins].astype(np.int32), kind='stable')]
                 suppressed = np.zeros(values.size, dtype=bool)
                 separation = int(math.ceil(min(
-                    self._peak_separation / self._range_resolution, values.size
+                    self._peak_separation / self._range_axis.spacing, values.size
                 )))
                 kept = []
                 for index in ranked:
@@ -471,8 +471,8 @@ class FftSweepAssembler(Node):
             keep = np.argsort(-intensities.astype(np.int32), kind='stable')[:self._max_points]
             bins = np.sort(bins[keep])
 
-        ranges = bins.astype(np.float32) * self._range_resolution
-        bearing = angle + self._azimuth_offset
+        ranges = self._range_axis.metres(bins.astype(np.float64)).astype(np.float32)
+        bearing = ros_bearing(angle, self._azimuth_offset)
         points = np.empty((bins.size, 4), dtype=np.float32)
         points[:, 0] = ranges * math.cos(bearing)
         points[:, 1] = ranges * math.sin(bearing)
@@ -529,15 +529,15 @@ class FftSweepAssembler(Node):
         increment = 2 * math.pi / count
         scan = LaserScan()
         scan.header = header
-        scan.angle_min = float((first.angle + self._azimuth_offset) % (2 * math.pi))
-        scan.angle_increment = float(increment)
+        scan.angle_min = float(ros_bearing(first.angle, self._azimuth_offset) % (2 * math.pi))
+        scan.angle_increment = -increment
         scan.angle_max = scan.angle_min + (count - 1) * scan.angle_increment
         scan.scan_time = 1.0 / self._rotation_rate if self._rotation_rate else 0.0
-        scan.range_min = self._min_range
-        scan.range_max = min(self._max_range, (first.values.size - 1) * self._range_resolution)
+        scan.range_min = max(self._min_range, self._range_axis.offset)
+        scan.range_max = min(self._max_range, self._range_axis.metres(first.values.size - 1))
         if scan.range_max < scan.range_min:
             return
-        # NaN: unobserved angle. +inf: observed angle with no selected return.
+        # A filtered radar ray supplies no evidence of clear space.
         ranges = np.full(count, np.nan, dtype=np.float32)
         intensities = np.zeros(count, dtype=np.float32)
         observed = np.zeros(count, dtype=bool)
@@ -557,14 +557,12 @@ class FftSweepAssembler(Node):
             timing_valid &= (not observed[index] and abs(
                 (stamp_ns - first_ns) * 1e-9 - index * nominal_dt
             ) <= max(1e-6, nominal_dt * 0.1))
-            if not observed[index]:
-                ranges[index] = np.inf
             observed[index] = True
             if not bins.size:
                 continue
             selected = (bins[0] if self._scan_selection == 'nearest'
                         else bins[np.argmax(spoke.values[bins])])
-            distance = float(selected * self._range_resolution)
+            distance = self._range_axis.metres(int(selected))
             intensity = float(spoke.values[selected])
             if (not math.isfinite(float(ranges[index]))
                 or (self._scan_selection == 'nearest' and distance < ranges[index])

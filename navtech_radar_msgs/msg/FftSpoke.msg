@@ -17,8 +17,8 @@ uint32 ntp_split_seconds
 
 uint16 sweep_counter
 
-# Raw encoder count and derived angle in radians, normalized to [0, 2*pi).
-# No mount offset is applied.
+# Native encoder count and clockwise angle in radians, normalized to [0, 2*pi).
+# The derived ROS bearing is yaw offset minus this angle.
 uint16 azimuth
 float64 azimuth_angle
 

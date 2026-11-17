@@ -13,13 +13,16 @@ uint16 encoder_size
 uint16 bin_size
 uint16 range_bins
 
-# Derived SI value in metres per bin.
+# Nominal SI spacing in metres per bin before range calibration.
 float64 range_resolution
 
 # Revolutions and spokes per second, respectively.
 uint16 expected_rotation_rate
 uint16 packet_rate
 
+# Metres at bin i = i * range_resolution * range_gain + range_offset.
+# Gain is dimensionless, offset is in metres. Use (1, 0) for nominal geometry.
+# For compatibility a zero-initialized pair (0, 0) also means nominal geometry.
 float32 range_gain
 float32 range_offset
 uint8 sample_bit_depth

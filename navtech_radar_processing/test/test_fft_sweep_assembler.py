@@ -275,7 +275,7 @@ def test_peak_selection_cloud_bytes_and_empty_cloud(make_node):
     node._finish_sweep()
     cloud = node._point_cloud_publisher.messages[0]
     points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
-    np.testing.assert_allclose(points, [[1.5, 0, 0, 200], [0, 1.5, 0, 200]], atol=1e-6)
+    np.testing.assert_allclose(points, [[1.5, 0, 0, 200], [0, -1.5, 0, 200]], atol=1e-6)
     assert cloud.row_step == cloud.width * cloud.point_step == len(cloud.data)
     assert cloud.header == node._sweep_publisher.messages[0].header
     assert not cloud.is_bigendian
@@ -353,11 +353,16 @@ def test_scan_one_return_and_cloud_multiple_returns_share_geometry(make_node, se
     cloud = node._point_cloud_publisher.messages[0]
     np.testing.assert_allclose(scan.ranges, [expected] * 4)
     assert scan.angle_min == pytest.approx(math.pi / 2)
-    assert scan.angle_increment == pytest.approx(math.pi / 2)
-    assert scan.angle_max == pytest.approx(2 * math.pi)
+    assert scan.angle_increment == pytest.approx(-math.pi / 2)
+    assert scan.angle_max == pytest.approx(-math.pi)
     assert cloud.width == 8
     points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
-    np.testing.assert_allclose(points[:2], [[0, 0.5, 0, 150], [0, 1.5, 0, 200]], atol=1e-6)
+    directions = np.array([[0, 1], [1, 0], [0, -1], [-1, 0]])
+    np.testing.assert_allclose(points[::2, :2], 0.5 * directions, atol=1e-6)
+    np.testing.assert_allclose(points[1::2, :2], 1.5 * directions, atol=1e-6)
+    angles = scan.angle_min + np.arange(4) * scan.angle_increment
+    np.testing.assert_allclose(np.column_stack((np.cos(angles), np.sin(angles))),
+                               directions, atol=1e-6)
     assert scan.header == cloud.header
     assert sources == before
 
@@ -387,11 +392,11 @@ def test_partial_scan_start_stamp_gaps_duplicates_and_no_return(make_node):
         node._spoke_callback(spoke(azimuth, values=values, stamp=12))
     node._finish_sweep()
     scan = node._scan_publisher.messages[0]
-    assert scan.angle_min == pytest.approx(math.pi / 2)
+    assert scan.angle_min == pytest.approx(3 * math.pi / 2)
     assert scan.header.stamp.sec == 12
     assert scan.ranges[0] == 0.5
     assert math.isnan(scan.ranges[1]) and math.isnan(scan.ranges[3])
-    assert math.isinf(scan.ranges[2]) and scan.ranges[2] > 0
+    assert math.isnan(scan.ranges[2])
     assert list(scan.intensities) == [150, 0, 0, 0]
     assert scan.time_increment == 0.0
     assert scan.range_max == 2.0
@@ -488,3 +493,40 @@ def test_namespaced_dds_pipeline(context):
         executor.shutdown()
         peer.destroy_node()
         node.destroy_node()
+
+
+@pytest.mark.parametrize('gain,offset', [(-1.0, 0.0), (0.0, 1.0), (float('nan'), 0.0),
+                                         (1.0, float('inf'))])
+def test_invalid_range_calibration_retains_active_config(make_node, gain, offset):
+    node = make_node()
+    node._configuration_callback(configuration())
+    cfg = configuration(version=2)
+    cfg.range_gain, cfg.range_offset = gain, offset
+    node._configuration_callback(cfg)
+    assert node._configuration_version == 1
+
+
+def test_cfar_separation_uses_calibrated_metres(make_node):
+    node = make_node(peak_selection='cfar', cfar_training_cells=1, cfar_guard_cells=0,
+                     cfar_threshold_offset=0.0, intensity_threshold=100,
+                     min_peak_separation=1.5, min_range=1.0, max_range=3.0)
+    cfg = configuration(bins=8)
+    cfg.range_gain, cfg.range_offset = 2.0, -1.0
+    node._configuration_callback(cfg)
+    levels = np.array([0, 0, 300, 0, 500, 0, 700, 0], dtype=np.uint16)
+    np.testing.assert_array_equal(node._extract_peak_bins(levels), [2, 4])
+
+
+def test_duplicate_empty_ray_invalidates_uniform_timing(make_node):
+    node = make_node(publish_scan=True, min_range=0.0)
+    cfg = configuration()
+    cfg.expected_rotation_rate = 4
+    node._configuration_callback(cfg)
+    for index in (0, 0, 1, 2, 3):
+        msg = spoke(index * 90, version=1, values=[0] * 3)
+        msg.header.stamp.nanosec = index * 62500000
+        node._spoke_callback(msg)
+    node._finish_sweep()
+    scan = node._scan_publisher.messages[0]
+    assert all(math.isnan(r) for r in scan.ranges)
+    assert scan.time_increment == 0.0

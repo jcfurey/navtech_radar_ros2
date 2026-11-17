@@ -17,7 +17,7 @@ constexpr double turn = 2 * CV_PI;
 
 double wrap(double x, double period) {
   const double r = std::fmod(x, period);
-  return r < 0 ? r + period : r;
+  return r < 0 ? r + period : std::abs(r);
 }
 
 int nearest(double x) { return static_cast<int>(std::nearbyint(x)); }
@@ -56,11 +56,11 @@ void annotate_polar(cv::Mat3b &out, const Sweep &s, const Config &c, int width,
   text(out, heading_label(heading), {48, 40});
   for (int a : {0, 90, 180, 270}) {
     const int row = 52 + nearest(a * height / 360.0);
-    text(out, cv::format("%.0f", wrap(a + offset / radians, 360.0)),
+    text(out, cv::format("%.0f", wrap(offset / radians - a, 360.0)),
          {5, row + 5});
   }
   if (heading.robot_bearing) {
-    const int row = 52 + nearest(wrap(*heading.robot_bearing - offset, turn) *
+    const int row = 52 + nearest(wrap(offset - *heading.robot_bearing, turn) *
                                  height / turn) %
                              height;
     cv::line(out, {48, row}, {width + 47, row}, {255, 220, 0}, 1);
@@ -77,7 +77,8 @@ void annotate_polar(cv::Mat3b &out, const Sweep &s, const Config &c, int width,
        {48, height + 112});
   text(out,
        cv::format("%d Hz | %.2f cm/bin | raw FFT levels",
-                  int(c.expected_rotation_rate), s.range_resolution * 100),
+                  int(c.expected_rotation_rate),
+                  RangeAxis::from_config(c).spacing * 100),
        {48, height + 134});
 }
 
@@ -153,12 +154,15 @@ bool SweepRenderer::valid_configuration(const Config &c) {
          c.azimuth_samples > 0 && c.azimuth_samples <= 2048 &&
          c.azimuth_samples <= c.encoder_size && c.range_bins > 0 &&
          c.range_bins <= 16384 && std::isfinite(c.range_resolution) &&
-         c.range_resolution > 0;
+         c.range_resolution > 0 &&
+         RangeAxis::from_config(c).valid(c.range_bins);
 }
 
 void SweepRenderer::update_projection(int rows, int cols, int first, int stride,
-                                      double res, double extent) {
-  const Projection key{rows, cols, first, stride, res, extent};
+                                      const RangeAxis &range_axis,
+                                      double extent) {
+  const Projection key{
+      rows, cols, first, stride, range_axis.spacing, range_axis.offset, extent};
   if (projection_ == key)
     return;
   const int size = settings_.cartesian_size;
@@ -175,12 +179,13 @@ void SweepRenderer::update_projection(int rows, int cols, int first, int stride,
     auto *out = indices_.ptr<int>(y);
     for (int x = 0; x < size; ++x) {
       const double range = std::hypot(axis[y], axis[x]);
-      const double bin = range / res - first;
+      const double bin =
+          (range - range_axis.offset) / range_axis.spacing - first;
       if (range < settings_.min_range || range > extent || bin < 0) {
         out[x] = -1;
         continue;
       }
-      const double angle = wrap(std::atan2(axis[x], axis[y]) - offset_, turn);
+      const double angle = wrap(offset_ - std::atan2(axis[x], axis[y]), turn);
       const int row = nearest(angle * rows / turn) % rows;
       out[x] = row * cols +
                static_cast<int>(std::min(bin / stride, double(cols - 1)));
@@ -209,7 +214,9 @@ void SweepRenderer::update_colors(const cv::Mat1w &grid,
                        c.encoder_size,
                        rows,
                        c.range_bins,
-                       s.range_resolution};
+                       s.range_resolution,
+                       c.range_gain,
+                       c.range_offset};
   const int64_t stamp =
       int64_t(s.header.stamp.sec) * 1000000000 + s.header.stamp.nanosec;
   if (epoch_ != epoch || stamp < stamp_) {
@@ -253,11 +260,9 @@ void SweepRenderer::render(const Sweep &s, const Config &c,
     throw std::invalid_argument(
         "Sweep image or encoder metadata does not match configuration");
   const int width = image.width;
-  const int first = static_cast<int>(
-      std::ceil(std::min(settings_.min_range / res, double(width))));
-  const int last = std::min(
-      width,
-      1 + static_cast<int>(std::min(settings_.max_range / res, double(width))));
+  const auto range = RangeAxis::from_config(c);
+  const auto [first, last] =
+      range.window(width, settings_.min_range, settings_.max_range);
   if (first >= last)
     throw std::invalid_argument("Display range does not overlap the FFT bins");
   const int stride =
@@ -306,12 +311,14 @@ void SweepRenderer::render(const Sweep &s, const Config &c,
         dest[col] = colors_[levels[col]];
     }
     if (settings_.annotate)
-      annotate_polar(out, s, c, cols, first * res, (last - 1) * res, low_,
-                     high_, offset_, coverage, heading);
+      annotate_polar(out, s, c, cols, range.metres(first),
+                     range.metres(last - 1), low_, high_, offset_, coverage,
+                     heading);
   }
   if (cartesian) {
-    const double extent = std::min(settings_.max_range, (width - 1) * res);
-    update_projection(rows, cols, first, stride, res, extent);
+    const double extent =
+        std::min(settings_.max_range, range.metres(width - 1));
+    update_projection(rows, cols, first, stride, range, extent);
     auto out = canvas(*cartesian, s, indices_.rows, indices_.cols);
     const auto *levels = grid.ptr<uint16_t>();
     for (int y = 0; y < out.rows; ++y) {

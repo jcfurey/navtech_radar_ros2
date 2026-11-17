@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "navtech_radar_msgs/msg/fft_spoke.hpp"
+#include "radar_geometry.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 
@@ -41,16 +42,13 @@ struct DetectionSettings {
 class PeakDetector {
 public:
   const std::vector<int> &select(const std::vector<uint16_t> &samples,
-                                 double resolution,
+                                 const RangeAxis &axis,
                                  const DetectionSettings &p) {
     const int width = static_cast<int>(samples.size());
     const int margin = p.cfar ? p.training + p.guard : 1;
-    const int first =
-        std::max(margin, static_cast<int>(std::ceil(std::min(
-                             double(width), p.min_range / resolution))));
-    const int end = std::min(width - margin,
-                             1 + static_cast<int>(std::min(
-                                     double(width), p.max_range / resolution)));
+    const auto [start, stop] = axis.window(width, p.min_range, p.max_range);
+    const int first = std::max(margin, start);
+    const int end = std::min(width - margin, stop);
     bins_.clear();
     if (first >= end)
       return bins_;
@@ -74,7 +72,7 @@ public:
       bins_.push_back(i);
     }
     const int separation = static_cast<int>(
-        std::ceil(std::min(double(width), p.separation / resolution)));
+        std::ceil(std::min(double(width), p.separation / axis.spacing)));
     if (p.cfar && separation > 1 && bins_.size() > 1) {
       std::sort(bins_.begin(), bins_.end(), [&](int a, int b) {
         return samples[a] == samples[b] ? a < b : samples[a] > samples[b];
@@ -124,7 +122,7 @@ inline Cloud empty_cloud(const std_msgs::msg::Header &header) {
 }
 
 inline void append_points(Cloud &cloud, const Spoke &s,
-                          const std::vector<int> &bins, double resolution,
+                          const std::vector<int> &bins, const RangeAxis &axis,
                           double offset, int limit, std::vector<int> &scratch) {
   const auto *selected = &bins;
   if (limit > 0 && bins.size() > static_cast<size_t>(limit)) {
@@ -138,12 +136,12 @@ inline void append_points(Cloud &cloud, const Spoke &s,
     std::sort(scratch.begin(), scratch.end());
     selected = &scratch;
   }
-  const float x = std::cos(s.azimuth_angle + offset),
-              y = std::sin(s.azimuth_angle + offset);
+  const double bearing = ros_bearing(s.azimuth_angle, offset);
+  const float x = std::cos(bearing), y = std::sin(bearing);
   auto pos = cloud.data.size();
   cloud.data.resize(pos + selected->size() * cloud.point_step);
   for (const auto i : *selected) {
-    const float r = static_cast<float>(i) * static_cast<float>(resolution);
+    const float r = static_cast<float>(axis.metres(i));
     const std::array<float, 4> point = {r * x, r * y, 0,
                                         static_cast<float>(s.data[i])};
     std::memcpy(cloud.data.data() + pos, point.data(), cloud.point_step);
@@ -155,23 +153,24 @@ inline void append_points(Cloud &cloud, const Spoke &s,
 
 class ScanBuilder {
 public:
-  ScanBuilder(const Spoke &first, int count, double resolution, int rate,
+  ScanBuilder(const Spoke &first, int count, const RangeAxis &axis, int rate,
               double offset, const DetectionSettings &p)
       : start_(first.azimuth_angle),
         first_stamp_(nanoseconds(first.header.stamp)), increment_(tau / count),
-        dt_(rate ? 1.0 / (double(rate) * count) : 0.0), regular_(rate != 0) {
+        dt_(rate ? 1.0 / (double(rate) * count) : 0.0), regular_(rate != 0),
+        observed_(count, false) {
     scan.header = first.header;
-    scan.angle_min = positive_angle(start_ + offset);
-    scan.angle_max = positive_angle(start_ + offset) + (count - 1) * increment_;
-    scan.angle_increment = increment_;
+    const double first_bearing = positive_angle(ros_bearing(start_, offset));
+    scan.angle_min = first_bearing;
+    scan.angle_max = first_bearing - (count - 1) * increment_;
+    scan.angle_increment = -increment_;
     scan.scan_time = rate ? 1.0 / rate : 0.0;
-    scan.range_min = p.min_range;
-    scan.range_max =
-        std::min(p.max_range, (first.data.size() - 1) * resolution);
+    scan.range_min = std::max(p.min_range, axis.offset);
+    scan.range_max = std::min(p.max_range, axis.metres(first.data.size() - 1));
     scan.ranges.assign(count, std::numeric_limits<float>::quiet_NaN());
     scan.intensities.assign(count, 0);
   }
-  void add(const Spoke &s, const std::vector<int> &bins, double resolution,
+  void add(const Spoke &s, const std::vector<int> &bins, const RangeAxis &axis,
            bool nearest) {
     const auto position = positive_angle(s.azimuth_angle - start_) / increment_;
     const auto cell = static_cast<size_t>(std::llround(position));
@@ -183,10 +182,9 @@ public:
     auto &range = scan.ranges[i];
     auto &level = scan.intensities[i];
     const auto elapsed = (nanoseconds(s.header.stamp) - first_stamp_) * 1e-9;
-    regular_ = regular_ && std::isnan(range) &&
+    regular_ = regular_ && !observed_[i] &&
                std::abs(elapsed - i * dt_) <= std::max(1e-6, dt_ * 0.1);
-    if (std::isnan(range))
-      range = std::numeric_limits<float>::infinity();
+    observed_[i] = true;
     if (bins.empty())
       return;
     const int best = nearest ? bins.front()
@@ -194,7 +192,7 @@ public:
                                                  [&](int a, int b) {
                                                    return s.data[a] < s.data[b];
                                                  });
-    const float distance = best * resolution;
+    const float distance = axis.metres(best);
     if (!std::isfinite(range) ||
         (nearest ? distance < range : s.data[best] > level)) {
       range = distance;
@@ -212,5 +210,6 @@ private:
   int64_t first_stamp_;
   double increment_, dt_;
   bool regular_;
+  std::vector<bool> observed_;
 };
 } // namespace radar

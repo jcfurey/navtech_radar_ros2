@@ -19,12 +19,13 @@ SHA-256: `101a84b310e489b2f1de7b76f69ec5c48611164dceffd3bb814cad8d94e8e806`.
 | Azimuth field of view | 360° | 400 angular samples per revolution |
 | Rotation rate | 4 Hz | 4 Hz |
 | Azimuth sampling | 0.9° | 0.9°, encoder size 5600 |
-| Range | 500 m radius; 1000 m diameter | 6000 bins; last bin about 262.76 m |
+| Range | 500 m radius; 1000 m diameter | 6000 bins, last bin at a nominal 262.76 m |
 | Range spacing/resolution | 17.5 cm | 4.38 cm bin spacing (`BinSize=438`) |
 | Raw representation | Not specified | 16-bit FFT levels |
 
 This later datasheet describes a standard product configuration, not the
 serial-specific settings of the April 2024 recording. Conversion uses the
-bag's configuration. Neither angular sampling nor bin spacing alone establishes
+bag's nominal spacing and assumes identity range calibration because the recording
+omits the gain and offset. Neither angular sampling nor bin spacing alone establishes
 the ability to resolve separate targets. No elevation, complex phase, or Doppler
 measurement can be recovered from these FFT messages.

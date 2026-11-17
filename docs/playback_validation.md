@@ -142,8 +142,8 @@ The workspace launch and robot-description defaults now use roll 0. The
 [workspace patch](tamu_planar_mount.patch) preserves both edits in this driver
 repository. The historical `LWLRF` source is unchanged. This corrects the
 display convention; translation and yaw still require physical calibration.
-The image projection and point extraction formulas are unchanged. The previews
-were regenerated with the corrected mount for their TF-derived forward markers.
+That change addressed only the mount. The encoder sign was subsequently checked
+against vehicle motion as described below.
 
 Validation expands the installed robot Xacro, checks agreement with the launch
 default, and verifies that +y retains positive mounting-frame y. A second
@@ -161,10 +161,10 @@ nearest-return scans.
 
 | Measured time for 32 full revolutions | Python | C++ |
 | --- | ---: | ---: |
-| Adapter CPU | 4.33 s | 1.56 s |
-| Assembler CPU | 6.98 s | 2.55 s |
-| Combined node CPU | 11.31 s | 4.11 s |
-| Elapsed including feeder, DDS, and output checks | 6.70 s | 3.40 s |
+| Adapter CPU | 4.27 s | 1.60 s |
+| Assembler CPU | 6.93 s | 2.56 s |
+| Combined node CPU | 11.20 s | 4.16 s |
+| Elapsed including feeder, DDS, and output checks | 6.65 s | 3.41 s |
 
 The [comparison script](../tools/compare_playback.py) preloads the bag's spokes,
 publishes the recorded configuration and verifies all four outputs with a probe
@@ -202,8 +202,8 @@ The [image comparison script](../tools/compare_images.py) feeds the installed C+
 and Python visualizers identical sweeps from the route 1/run 2 recording. On
 ROS 2 Lyrical, both produced identical headers, dimensions, encodings, strides
 and pixel bytes for the annotated polar and Cartesian views on 32 full revolutions.
-With the default display settings, the C++ visualizer used 1.60 s of process CPU
-and the Python visualizer used 2.68 s. Each process had subscribers for both
+With the default display settings, the C++ visualizer used 1.49 s of process CPU
+and the Python visualizer used 2.51 s. Each process had subscribers for both
 views. Measurement started after an initial partial sweep warmed the projection
 cache. Bag decoding, sweep assembly, the comparison process and RViz were
 outside the measurement. The replay used empty heading frame parameters.
@@ -214,3 +214,30 @@ pooling, contrast history across rewinds and configuration changes, and gamma.
 A timestamped TF fixture checks the arrow and heading text against an interpolated
 45-degree vehicle yaw, then seeks before the transform history and checks the
 unavailable-heading display.
+
+## Bearing and range validation
+
+A near-stationary turn in the April 2024 TAMU route 1/run 2 recording gives an
+independent check on left and right. Near 869 s, the vehicle translated 0.014 m
+and yawed −20.314° between two sweep midpoints one second apart, using
+interpolated `/lester/odom` poses. Stationary surroundings should therefore
+move toward positive body bearings. Cross-correlation of the two installed
+renderers' plan views measured a +20.700° scene shift, within one 0.9° sample.
+This tests handedness on the zero-roll TAMU installation. The constant mounting
+yaw and translation still require an external calibration.
+
+With the standalone workspace sourced, run the check on the original MCAP
+directory. It compares both executables' Cartesian pixels, samples the 12–45 m
+annulus in counterclockwise ROS bearings, and correlates the azimuth profiles
+after standardizing each range column. [Regression script](../tools/check_tamu_turn.py)
+
+```bash
+python3 tools/check_tamu_turn.py /path/to/tamu_full_stack_route_1_run_2_2024-04-23-10-27-20_ros2_mcap
+```
+
+The legacy recording supplies nominal spacing only. A separate canonical DDS
+fixture uses 0.5 m nominal spacing, gain 2 and offset +1 m. Bins 2 and 4 appear
+at 3 m and 5 m on both installed assemblers, and the 7 m return lies outside
+the selected range. Other fixtures cover negative offsets, metric CFAR peak
+separation, the calibrated image projection, empty scan rays and zero-stamp TF.
+The recorded previews above use the corrected bearing with the zero-roll mount.

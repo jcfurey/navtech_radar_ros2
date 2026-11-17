@@ -7,6 +7,7 @@ builtin_interfaces/Time end_stamp
 uint32 configuration_version
 uint32 sweep_sequence
 uint8 sample_bit_depth
+# Nominal metres per bin. Use this version's RadarConfiguration for gain and offset.
 float64 range_resolution
 
 # mono16 for a high-precision stream. Rows are increasing encoder azimuth and

@@ -62,7 +62,8 @@ private:
 
   std::optional<double> yaw(const std::string &target,
                             const builtin_interfaces::msg::Time &stamp) const {
-    if (target.empty() || robot_.empty())
+    if (target.empty() || robot_.empty() ||
+        (stamp.sec == 0 && stamp.nanosec == 0))
       return {};
     try {
       const tf2::TimePoint time{std::chrono::seconds(stamp.sec) +
