@@ -186,3 +186,10 @@ an initial partial sweep, duplicate and missing bearings, full regular timing,
 CFAR and fixed thresholds, nearest/strongest scan selection, azimuth offset and
 cloud budget. Run the [standalone build and tests](../README.md#standalone-playback-on-ros-2-lyrical)
 for the configuration used here.
+
+A fresh clone built all four packages against the Lyrical underlay with the
+optional IASDK submodule uninitialized. `rosdep check` found all dependencies
+and `colcon test-result` reported zero failures. Running the installed
+`playback.launch.py` on the same MCAP delivered five 400-ray scans, five
+nonempty XYZI clouds and five 800 × 800 Cartesian images to a headless DDS
+subscriber. All three products used the `navtech` frame.
