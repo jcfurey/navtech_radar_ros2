@@ -7,11 +7,12 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
 
-  <exec_depend>diagnostic_msgs</exec_depend>
-  <exec_depend>nav_ross</exec_depend>
-  <exec_depend>navtech_radar_msgs</exec_depend>
-  <exec_depend>rcl_interfaces</exec_depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>nav_ross</depend>
+  <depend>navtech_radar_msgs</depend>
+  <depend>rcl_interfaces</depend>
   <exec_depend>rclpy</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>

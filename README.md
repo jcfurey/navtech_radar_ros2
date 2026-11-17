@@ -4,25 +4,47 @@ Lossless ROS 2 support for Navtech rotating radar, initially targeting the
 CTS350-X and the 16-bit high-precision FFT stream used by The Great Outdoors
 Dataset.
 
-## Status
+## Standalone playback on ROS 2 Lyrical
 
-This repository pins the Navtech IASDK and implements the lossless ROS API,
-legacy bag playback transport, and sweep assembly. A live IASDK transport node
-has not been implemented yet.
+The C++ adapter and sweep assembler process the CTS350-X's 16-bit FFT stream.
+They produce raw spokes, sweeps and images, with optional adaptive peak selection,
+planar point clouds and laser scans. The enhanced image renderer uses Python,
+NumPy and OpenCV. Live radar transport is still planned.
 
-The intended boundary is:
+This checkout contains all four ROS packages, including the legacy `nav_ross`
+interfaces. Start with a ROS 2 Lyrical installation, colcon, a C++17 compiler,
+and an initialized rosdep. Run the following in an empty workspace.
 
-- preserve every high-precision `uint16` FFT spoke and its sensor metadata;
-- keep the Navtech Colossus transport separate from ROS messages;
-- build sweep assembly, Cartesian projection, CFAR, and point clouds as
-  downstream components;
-- leave radar-to-robot TF ownership to the robot description or calibration
-  package.
+```bash
+source /opt/ros/lyrical/setup.bash
+mkdir -p src
+git clone --branch cpp https://github.com/jcfurey/navtech_radar_ros2.git src/navtech_radar_ros2
+rosdep install --from-paths src --ignore-src --rosdistro lyrical -r -y
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+source install/setup.bash
+colcon test --return-code-on-test-failure
+colcon test-result --verbose
+```
 
-See [docs/driver_design.md](docs/driver_design.md) for the research findings,
-proposed messages, QoS, and implementation sequence.
-The [hardware reference](docs/cts350x.md) includes Navtech's official CTS350-X
-datasheet and compares its standard settings with the recorded configuration.
+Set `bag` to the converted ROS 2 MCAP directory containing `metadata.yaml`.
+The launch plays only the two radar topics and recorded TF, publishes a clock,
+and starts a radar-frame RViz profile when requested.
+
+```bash
+ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap rviz:=true
+```
+
+Omit `bag` for an external player. Options include `cloud`, `scan`,
+`peak_selection`, `scan_selection`, `rate`, and `implementation:=python`
+for the reference nodes. The fixed frame in the included RViz profile is
+`navtech`. `robot_frame` and `heading_frame` enable the optional TF overlays
+when the corresponding transforms are available. Robot-specific mounting and
+the full TAMU viewer belong to the surrounding TAMU workspace.
+
+The radar model, recorded geometry and manufacturer datasheet are in the
+[hardware reference](docs/cts350x.md). Credit for the SDK, dataset, legacy
+interfaces and related projects is in [Sources and acknowledgments](THIRD_PARTY.md).
+Navtech lists this implementation in its [published works directory](https://navtechradar.atlassian.net/wiki/spaces/IA/pages/2408480879/Published+works+including+Navtech+Radar).
 
 ## Bag playback
 
@@ -43,7 +65,7 @@ topics without changing the source bag:
 /navtech_radar/scan          sensor_msgs/LaserScan (optional, lossy)
 ```
 
-The TAMU workspace's `view_bag.sh` launches this pipeline automatically.
+The installed executables `legacy_bag_driver` and `fft_sweep_assembler` are C++. The Python reference executables have the suffix `_py`. Both implementations accept the same ROS parameters, topic remaps and QoS settings.
 
 ## Enhanced images
 
@@ -138,12 +160,9 @@ lossy radar detection data: a missing detection is not evidence of free space,
 and LaserScan consumers can make assumptions specific to laser sensing.
 
 ```bash
-# TAMU workspace: turn on both RViz displays and their publication.
-./view_bag.sh radar_scan:=true radar_point_cloud:=true
-# Select the strongest radar reflector per scan bearing.
-./view_bag.sh radar_scan:=true radar_scan_selection:=strongest
-# Reproduce the original fixed-threshold extraction.
-./view_bag.sh radar_point_cloud:=true radar_peak_selection:=threshold
+ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap rviz:=true
+ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap scan_selection:=strongest
+ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap peak_selection:=threshold
 ```
 
 Other extraction parameters are `cfar_training_cells`, `cfar_guard_cells`,
@@ -220,24 +239,26 @@ All application parameters are validated at startup and read-only afterward;
 processing settings. ROS topic remapping and parameter overrides still apply
 at startup.
 
-## Build and tests
+## Performance and verification
 
-From a workspace containing this repo and the legacy `nav_ross` interfaces:
+On 32 full revolutions of the April 2024 TAMU recording, the C++ adapter and
+assembler together used 4.08 s of CPU versus 11.17 s for the Python nodes in
+one Release-build run. Both pipelines had subscribers for the raw sweep,
+raw image, CFAR cloud and nearest-return scan. The comparison checks serialized
+sweeps and scans, every raw image row, and cloud geometry and intensities.
+The benchmark preloads the same input spokes and waits for each revolution's
+outputs. Reader, viewer and comparison-process CPU are outside these figures.
+See the [measurement details](docs/playback_validation.md#native-playback-comparison).
+
+Run the same comparison on Linux from a sourced build:
 
 ```bash
-colcon build --packages-up-to navtech_radar_driver navtech_radar_processing \
-  --cmake-args -DBUILD_TESTING=ON
-source install/setup.bash
-colcon test --packages-select navtech_radar_driver navtech_radar_processing
-colcon test-result --verbose
+ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+  python3 src/navtech_radar_ros2/tools/compare_playback.py /path/to/ros2_mcap --rotations 32
 ```
 
-The tests use real generated ROS messages, serialization, and isolated ROS
-domains. They cover payload preservation, configuration transitions, malformed
-inputs, bounded buffering, rewind, partial-sweep policy, point-cloud bytes,
-namespace handling, late subscribers, and paused simulated time. See
-[docs/playback_validation.md](docs/playback_validation.md) for recorded-data
-validation, performance measurements, and SDK integration findings.
+The registered tests also exercise both installed implementations with a small
+deterministic fixture. They run without a bag or radar hardware.
 
 ## SDK submodule
 
@@ -275,6 +296,7 @@ gitlink; local uncommitted SDK patches must not become driver dependencies.
 
 ```text
 navtech_radar_ros2/
+├── nav_ross/                   # legacy bag-compatible IDL
 ├── docs/
 ├── navtech_radar_driver/       # transport nodes and legacy bag adapter
 ├── navtech_radar_msgs/         # configuration, spoke, and sweep interfaces

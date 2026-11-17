@@ -15,4 +15,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 
 ament_export_dependencies(rosidl_default_runtime)
+install(FILES ../LICENSE ../THIRD_PARTY.md DESTINATION share/${PROJECT_NAME})
+
 ament_package()

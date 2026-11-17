@@ -19,7 +19,7 @@ contains the original high-precision FFT stream on `/Navtech/FFTData` as
 - encoder azimuth, sweep counter, and radar timestamp on every spoke
 
 This is raw FFT/video data, not raw ADC or complex I/Q data. The exact
-reconstructed legacy schemas are in `src/nav_ross/msg`.
+reconstructed legacy schemas are in [nav_ross/msg](../nav_ross/msg).
 
 The source was almost certainly the high-resolution path in
 [`unmannedlab/navtechradar_usl`](https://github.com/unmannedlab/navtechradar_usl),
@@ -189,7 +189,7 @@ consumer begin from the same unchanged `uint16` FFT values.
 3. Validate sweep assembly, timestamps, and drop detection against this bag.
    (Implemented for playback; hardware packet fixtures remain.)
 4. Add the live Colossus transport node when CTS350-X hardware is available.
-5. Add Cartesian projection and CFAR only after the raw contract is stable.
+5. Derive Cartesian images, CFAR clouds and scans from the raw stream. (Implemented for playback.)
 
 The bag adapter provides a repeatable test source before live hardware is
 connected and prevents the production API from inheriting the shortcomings of

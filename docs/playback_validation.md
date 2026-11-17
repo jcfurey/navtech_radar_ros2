@@ -149,3 +149,40 @@ Validation expands the installed robot Xacro, checks agreement with the launch
 default, and verifies that +y retains positive mounting-frame y. A second
 headless DDS playback check also verifies the live static TF has zero roll and
 pitch while delivering the namespaced radar scan, cloud and image products.
+
+## Native playback comparison
+
+On November 17, 2026, both installed implementations processed the first partial
+revolution and the next 32 complete revolutions of the April 2024 route 1/run 2
+recording on ROS 2 Lyrical (Linux x86-64, CMake Release). The partial revolution
+served as warmup. Both runs used 400 spokes × 6,000 uint16 samples per full
+revolution, identical CFAR parameters, a 48-point cloud budget per spoke and
+nearest-return scans.
+
+| Measured time for 32 full revolutions | Python | C++ |
+| --- | ---: | ---: |
+| Adapter CPU | 4.26 s | 1.54 s |
+| Assembler CPU | 6.91 s | 2.54 s |
+| Combined node CPU | 11.17 s | 4.08 s |
+| Elapsed including feeder, DDS, and output checks | 6.65 s | 3.42 s |
+
+The [comparison script](../tools/compare_playback.py) preloads the bag's spokes,
+publishes one configuration and sends bounded bursts of legacy FFT messages.
+It waits for the sweep, mono16 image, point cloud, and scan after each wrap.
+CPU measurements use the two child processes' user and system time with
+subscribers active. The feeder, file I/O, image renderer and RViz are outside
+the combined CPU measurement. This is a single-machine comparison for this
+workload. Whole-bag playback also carries the other sensors and repeated
+configuration messages.
+
+All 33 emitted raw images matched the recorded samples, including stable
+encoder ordering, timestamps and counters. The serialized sweep hashes and the
+serialized scans matched between implementations. Cloud sizes, intensity and
+z matched exactly, with xy checked at 2e-6 relative / 2e-5 m absolute tolerance.
+Both adapters used the same frozen simulated clock for comparable receipt stamps.
+
+The registered tests include a synthetic installed-executable comparison covering
+an initial partial sweep, duplicate and missing bearings, full regular timing,
+CFAR and fixed thresholds, nearest/strongest scan selection, azimuth offset and
+cloud budget. Run the [standalone build and tests](../README.md#standalone-playback-on-ros-2-lyrical)
+for the configuration used here.

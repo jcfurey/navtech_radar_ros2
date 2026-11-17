@@ -1,0 +1,14 @@
+#include "std_msgs/msg/Header.idl"
+
+module nav_ross {
+  module msg {
+    struct HighPrecisionFFTData {
+      std_msgs::msg::Header header;
+      float angle;
+      uint16 azimuth;
+      uint16 sweepCounter;
+      uint32 size;
+      sequence<uint16> data;
+    };
+  };
+};

@@ -1,0 +1,28 @@
+name: Standalone ROS 2 playback
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    container: ros:lyrical-ros-base
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/navtech_radar_ros2
+      - name: Install declared dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential python3-colcon-common-extensions python3-rosdep
+          rosdep update --rosdistro lyrical
+          rosdep install --from-paths src --ignore-src --rosdistro lyrical -y
+      - name: Build and test Release executables
+        run: |
+          source /opt/ros/lyrical/setup.bash
+          colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          source install/setup.bash
+          colcon test --return-code-on-test-failure
+          colcon test-result --verbose
