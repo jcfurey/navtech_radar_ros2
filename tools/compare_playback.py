@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Compare both installed playback pipelines on the same recorded revolutions (Linux)."""
 import argparse
+from contextlib import ExitStack
+from copy import deepcopy
 import hashlib
 import os
 from pathlib import Path
 import signal
 import subprocess
 import time
-from contextlib import ExitStack
+from uuid import uuid4
 
 from ament_index_python.packages import get_package_prefix
 from nav_ross.msg import HighPrecisionFFTData, nav_msg
-from navtech_radar_msgs.msg import FftSpoke, FftSweep, RadarConfiguration
+from navtech_radar_msgs.msg import FftSweep, RadarConfiguration
 import numpy as np
 import rclpy
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
-from rclpy.serialization import deserialize_message, serialize_message
+from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import Image, LaserScan, PointCloud2
 
 
@@ -65,19 +67,36 @@ def run_pipeline(implementation, config, groups, sentinel, selection='nearest', 
                  assembler_options=()):
     """Feed bounded bursts and wait for all four products at every revolution."""
     suffix = '_py' if implementation == 'python' else ''
-    node = rclpy.create_node('playback_compare', namespace='/navtech_check')
+    namespace = f'/navtech_check_{uuid4().hex}'
+    node = rclpy.create_node('playback_compare', namespace=namespace)
+    # Mark discovery traffic with a time beyond the first acquisition. The
+    # first recorded spoke then rewinds both assemblers to an empty buffer.
+    low = deepcopy(groups[0][0])
+    low.header.stamp.sec = min(sentinel.header.stamp.sec + 1, 2147483647)
+    low.header.stamp.nanosec = 999999999
+    low.angle = 0.0
+    high = deepcopy(low)
+    high.angle = 270.0
     with ExitStack() as cleanup:
         cleanup.callback(node.destroy_node)
         cfg_pub = node.create_publisher(nav_msg, 'legacy_config', 1)
         fft_pub = node.create_publisher(HighPrecisionFFTData, 'legacy_fft', QoSProfile(depth=512))
-        configs, outputs = [], {}
+        configs, outputs, probe_products = [], {}, set()
         node.create_subscription(RadarConfiguration, 'navtech_radar/configuration', configs.append,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
+        def collect(key, message):
+            if message.header.stamp == low.header.stamp:
+                probe_products.add(key)
+            else:
+                outputs[key].append(message)
+
         for key, kind, qos in [('fft/sweep', FftSweep, 2), ('fft/image', Image, 2),
                                ('scan', LaserScan, qos_profile_sensor_data),
                                ('point_cloud', PointCloud2, qos_profile_sensor_data)]:
             outputs[key] = []
-            node.create_subscription(kind, 'navtech_radar/' + key, outputs[key].append, qos)
+            node.create_subscription(kind, 'navtech_radar/' + key,
+                                     lambda msg, key=key: collect(key, msg), qos)
 
         processes = []
         for package, exe, params in [
@@ -87,80 +106,94 @@ def run_pipeline(implementation, config, groups, sentinel, selection='nearest', 
                 ('navtech_radar_driver', 'legacy_bag_driver', [
                     'legacy_configuration_topic:=legacy_config', 'legacy_fft_topic:=legacy_fft'])]:
             binary = Path(get_package_prefix(package)) / 'lib' / package / (exe + suffix)
-            args = [str(binary), '--ros-args', '-r', '__ns:=/navtech_check', '-p', 'use_sim_time:=true']
+            args = [str(binary), '--ros-args', '-r', '__ns:=' + namespace, '-p', 'use_sim_time:=true']
             for param in params:
                 args.extend(['-p', param])
             process = subprocess.Popen(args)
             cleanup.callback(stop, process)
             processes.append(process)
 
-        def wait_until(predicate):
+        def wait_until(predicate, description, retry=None):
             deadline = time.monotonic() + 12
+            next_retry = 0
             while not predicate():
-                if time.monotonic() > deadline or any(p.poll() is not None for p in processes):
-                    raise RuntimeError(f'{implementation} pipeline timed out: '
-                                       f'{ {k: len(v) for k,v in outputs.items()} }')
+                now = time.monotonic()
+                if now > deadline or any(p.poll() is not None for p in processes):
+                    raise RuntimeError(f'{implementation} pipeline failed while waiting for {description}')
+                if retry and now >= next_retry:
+                    retry()
+                    next_retry = now + 0.25
                 rclpy.spin_once(node, timeout_sec=0.01)
 
         wait_until(lambda: cfg_pub.get_subscription_count() == fft_pub.get_subscription_count() == 1
                    and node.count_subscribers('navtech_radar/fft/spoke') == 1
                    and node.count_subscribers('navtech_radar/configuration') >= 2
-                   and all(node.count_publishers('navtech_radar/' + key) for key in outputs))
-        # Repeating configuration before startup matches TAMU. Wait for the
-        # actual reader matches (graph discovery can precede DDS matching).
-        cfg_pub.publish(config)
-        wait_until(lambda: configs)
-        first_seen = []
-        probe = node.create_subscription(FftSpoke, 'navtech_radar/fft/spoke', first_seen.append, qos_profile_sensor_data)
-        wait_until(lambda: probe.get_publisher_count() == 1)
-        # Fence on a pre-roll spoke; rewind before the real first spoke. The
-        # assembler ignores a one-spoke partial revolution at the boundary.
-        warmup = deserialize_message(serialize_message(groups[0][0]), HighPrecisionFFTData)
-        warmup.header.stamp.sec += 1
-        fft_pub.publish(warmup)
-        wait_until(lambda: first_seen)
-        node.destroy_subscription(probe)
+                   and all(node.count_publishers('navtech_radar/' + key) for key in outputs),
+                   'endpoint discovery')
+        wait_until(lambda: configs, 'configuration', lambda: cfg_pub.publish(config))
+
+        def publish_probe():
+            for spoke in (low, high, low):
+                fft_pub.publish(spoke)
+
+        wait_until(lambda: probe_products == outputs.keys(), 'all four probe products', publish_probe)
 
         summaries = []
+        first_sequence = None
         wall_start, usage_start = time.monotonic(), [cpu_seconds(p) for p in processes]
         for n, rows in enumerate(groups):
             if n == 1:
                 wall_start, usage_start = time.monotonic(), [cpu_seconds(p) for p in processes]
-            boundary = groups[n+1][0] if n+1 < len(groups) else sentinel
+            boundary = groups[n + 1][0] if n + 1 < len(groups) else sentinel
             inputs = rows if n == 0 else rows[1:]
             for i, spoke in enumerate(inputs):
                 fft_pub.publish(spoke)
                 if i % 32 == 31:
                     time.sleep(0.001)
             fft_pub.publish(boundary)
-            wait_until(lambda: all(outputs.values()))
-            sweep, image, scan, cloud = (outputs[k].pop(0) for k in ('fft/sweep','fft/image','scan','point_cloud'))
+            wait_until(lambda: all(outputs.values()), f'products for recorded revolution {n}')
+            sweep, image, scan, cloud = (outputs[k].pop(0) for k in
+                                         ('fft/sweep', 'fft/image', 'scan', 'point_cloud'))
             ordered = sorted(rows, key=lambda s: s.azimuth)
             assert sweep.image == image and sweep.header == scan.header == cloud.header
-            assert sweep.sweep_sequence == n and image.width == config.RangeInBins
+            if first_sequence is None:
+                first_sequence = sweep.sweep_sequence
+            assert sweep.sweep_sequence == (first_sequence + n) % (1 << 32)
+            assert image.width == config.RangeInBins
             assert sweep.header.stamp == rows[0].header.stamp and sweep.end_stamp == rows[-1].header.stamp
             assert list(sweep.encoder_values) == [s.azimuth for s in ordered]
             assert list(sweep.sweep_counters) == [s.sweepCounter for s in ordered]
             assert list(sweep.timestamps) == [s.header.stamp for s in ordered]
             assert image.data.tobytes() == b''.join(np.asarray(s.data, dtype='<u2').tobytes() for s in ordered)
             assert len(scan.ranges) == config.AzimuthSamples
-            summaries.append((hashlib.sha256(serialize_message(sweep)).digest(), scan, cloud))
-        usage = [cpu_seconds(p)-start for p,start in zip(processes,usage_start)]
-        return summaries, usage, time.monotonic()-wall_start
+            # Retain every field while bounding memory on long recordings.
+            # DDS alignment padding is transport-specific, outside these fields.
+            image_hash = hashlib.sha256(sweep.image.data).digest()
+            sweep.image.data = []
+            sweep.sweep_sequence = n
+            summaries.append(((sweep, image_hash), scan, cloud))
+        usage = [cpu_seconds(p) - start for p, start in zip(processes, usage_start)]
+        return summaries, usage, time.monotonic() - wall_start
 
 
 def compare(left, right):
     assert len(left) == len(right)
-    for (raw, scan, cloud), (other_raw, other_scan, other_cloud) in zip(left,right):
+    for (raw, scan, cloud), (other_raw, other_scan, other_cloud) in zip(left, right):
         assert raw == other_raw
-        assert serialize_message(scan) == serialize_message(other_scan)
+        for field in scan.get_fields_and_field_types():
+            a, b = getattr(scan, field), getattr(other_scan, field)
+            if field in ('ranges', 'intensities'):
+                assert a.tobytes() == b.tobytes(), field
+            else:
+                assert a == b, field
         assert cloud.fields == other_cloud.fields and cloud.width == other_cloud.width
         assert cloud.point_step == other_cloud.point_step == 16 and cloud.height == other_cloud.height == 1
         assert cloud.header == other_cloud.header and cloud.row_step == other_cloud.row_step
-        a = np.frombuffer(cloud.data, dtype='>f4' if cloud.is_bigendian else '<f4').reshape(-1,4)
-        b = np.frombuffer(other_cloud.data, dtype='>f4' if other_cloud.is_bigendian else '<f4').reshape(-1,4)
-        np.testing.assert_allclose(a[:,:2], b[:,:2], rtol=2e-6, atol=2e-5)
-        np.testing.assert_array_equal(a[:,2:], b[:,2:])
+        assert cloud.is_dense == other_cloud.is_dense
+        a = np.frombuffer(cloud.data, dtype='>f4' if cloud.is_bigendian else '<f4').reshape(-1, 4)
+        b = np.frombuffer(other_cloud.data, dtype='>f4' if other_cloud.is_bigendian else '<f4').reshape(-1, 4)
+        np.testing.assert_allclose(a[:, :2], b[:, :2], rtol=2e-6, atol=2e-5)
+        np.testing.assert_array_equal(a[:, 2:], b[:, 2:])
 
 
 def main():

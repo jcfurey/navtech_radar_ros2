@@ -29,7 +29,7 @@ def test_installed_pipelines(mode, selection):
     complete = [spoke(a, i + 3) for i, a in enumerate([0, 90, 180, 270])]
     sentinel = spoke(0, 7)
     # Each run launches different executables. Frozen sim time gives equal
-    # host stamps so even the serialized sweep metadata can be compared.
+    # host stamps so acquisition and receipt metadata can both be compared.
     with rclpy.init():
         results = [run_pipeline(impl, cfg, [partial, complete], sentinel,
                                 selection, mode, ['max_points_per_spoke:=1',

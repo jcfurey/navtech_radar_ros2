@@ -242,10 +242,10 @@ at startup.
 ## Performance and verification
 
 On 32 full revolutions of the April 2024 TAMU recording, the C++ adapter and
-assembler together used 4.08 s of CPU versus 11.17 s for the Python nodes in
+assembler together used 4.11 s of CPU versus 11.31 s for the Python nodes in
 one Release-build run. Both pipelines had subscribers for the raw sweep,
-raw image, CFAR cloud and nearest-return scan. The comparison checks serialized
-sweeps and scans, every raw image row, and cloud geometry and intensities.
+raw image, CFAR cloud and nearest-return scan. The comparison checks every raw
+image row, sweep metadata, scan fields, and cloud geometry and intensities.
 The benchmark preloads the same input spokes and waits for each revolution's
 outputs. Reader, viewer and comparison-process CPU are outside these figures.
 See the [measurement details](docs/playback_validation.md#native-playback-comparison).

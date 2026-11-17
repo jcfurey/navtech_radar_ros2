@@ -161,13 +161,14 @@ nearest-return scans.
 
 | Measured time for 32 full revolutions | Python | C++ |
 | --- | ---: | ---: |
-| Adapter CPU | 4.26 s | 1.54 s |
-| Assembler CPU | 6.91 s | 2.54 s |
-| Combined node CPU | 11.17 s | 4.08 s |
-| Elapsed including feeder, DDS, and output checks | 6.65 s | 3.42 s |
+| Adapter CPU | 4.33 s | 1.56 s |
+| Assembler CPU | 6.98 s | 2.55 s |
+| Combined node CPU | 11.31 s | 4.11 s |
+| Elapsed including feeder, DDS, and output checks | 6.70 s | 3.40 s |
 
 The [comparison script](../tools/compare_playback.py) preloads the bag's spokes,
-publishes one configuration and sends bounded bursts of legacy FFT messages.
+publishes the recorded configuration and verifies all four outputs with a probe
+before sending bounded bursts of recorded legacy FFT messages.
 It waits for the sweep, mono16 image, point cloud, and scan after each wrap.
 CPU measurements use the two child processes' user and system time with
 subscribers active. The feeder, file I/O, image renderer and RViz are outside
@@ -175,9 +176,10 @@ the combined CPU measurement. This is a single-machine comparison for this
 workload. Whole-bag playback also carries the other sensors and repeated
 configuration messages.
 
-All 33 emitted raw images matched the recorded samples, including stable
-encoder ordering, timestamps and counters. The serialized sweep hashes and the
-serialized scans matched between implementations. Cloud sizes, intensity and
+All 33 recorded raw images matched the source samples byte-for-byte, including
+rows with equal encoder counts in their arrival order. Both implementations
+agreed on sweep metadata, relative sequence numbers, scan fields, and the exact
+range and intensity array bytes. Cloud sizes, intensity and
 z matched exactly, with xy checked at 2e-6 relative / 2e-5 m absolute tolerance.
 Both adapters used the same frozen simulated clock for comparable receipt stamps.
 

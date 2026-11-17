@@ -1,6 +1,7 @@
 """Test display geometry and contrast without modifying the canonical FFT data."""
 
 from array import array
+from copy import deepcopy
 import math
 
 from fft_sweep_visualizer import FftSweepVisualizer, planar_yaw, SweepRenderer
@@ -49,7 +50,7 @@ def test_plan_view_cardinal_axes_and_raw_data_preserved():
     values = np.zeros((4, 33), dtype=np.uint16)
     values[:, 20] = [10, 20, 30, 40]
     sweep, config = fixture_messages(values)
-    original = serialize_message(sweep)
+    original = deepcopy(sweep)
     render = renderer()
     polar, plan = render.render(sweep, config)
     np.testing.assert_array_equal(plan[12, 32], render._colors[64])  # +x: up
@@ -58,7 +59,7 @@ def test_plan_view_cardinal_axes_and_raw_data_preserved():
     np.testing.assert_array_equal(plan[32, 52], render._colors[255])  # -y: right
     assert polar.shape == (4, 33, 3)
     assert plan.shape == (65, 65, 3)
-    assert serialize_message(sweep) == original
+    assert sweep == original
 
 
 def test_missing_azimuths_are_black_and_duplicate_peaks_are_retained():
@@ -194,14 +195,14 @@ def test_shared_azimuth_offset_rotates_only_derived_projection():
     values = np.zeros((4, 33), dtype=np.uint16)
     values[:, 20] = [10, 20, 30, 40]
     sweep, config = fixture_messages(values)
-    before = serialize_message(sweep)
+    before = deepcopy(sweep)
     original_polar, _ = renderer().render(sweep, config)
     render = renderer(azimuth_offset_degrees=90.0)
     polar, plan = render.render(sweep, config)
     np.testing.assert_array_equal(plan[32, 12], render._colors[64])
     np.testing.assert_array_equal(plan[52, 32], render._colors[128])
     np.testing.assert_array_equal(polar, original_polar)
-    assert serialize_message(sweep) == before
+    assert sweep == before
 
 
 def test_heading_quaternion_handles_inverted_mount_and_invalid_orientation():

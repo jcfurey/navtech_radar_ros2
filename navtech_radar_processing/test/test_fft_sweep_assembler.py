@@ -1,6 +1,7 @@
 """Lossless assembly, stream boundary, resource limit and ROS contract tests."""
 
 from array import array
+from copy import deepcopy
 import math
 import time
 
@@ -344,7 +345,7 @@ def test_scan_one_return_and_cloud_multiple_returns_share_geometry(make_node, se
         azimuth_offset_degrees=90.0,
     )
     sources = [spoke(a, values=[0, 150, 0, 200, 0]) for a in (0, 90, 180, 270)]
-    before = [serialize_message(s) for s in sources]
+    before = deepcopy(sources)
     for source in sources:
         node._spoke_callback(source)
     node._finish_sweep()
@@ -358,7 +359,7 @@ def test_scan_one_return_and_cloud_multiple_returns_share_geometry(make_node, se
     points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
     np.testing.assert_allclose(points[:2], [[0, 0.5, 0, 150], [0, 1.5, 0, 200]], atol=1e-6)
     assert scan.header == cloud.header
-    assert [serialize_message(s) for s in sources] == before
+    assert sources == before
 
 
 def test_scan_nearest_selection_precedes_cloud_budget(make_node):
