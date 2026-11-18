@@ -172,12 +172,13 @@ inline void append_points(Cloud &cloud, const Spoke &s,
     selected = &scratch;
   }
   const double bearing = ros_bearing(s.azimuth_angle, offset);
-  const float x = std::cos(bearing), y = std::sin(bearing);
+  const double x = std::cos(bearing), y = std::sin(bearing);
   auto pos = cloud.data.size();
   cloud.data.resize(pos + selected->size() * cloud.point_step);
   for (const auto i : *selected) {
-    const float r = static_cast<float>(axis.metres(i));
-    const std::array<float, 4> point = {r * x, r * y, 0,
+    const double r = axis.metres(i);
+    const std::array<float, 4> point = {static_cast<float>(r * x),
+                                        static_cast<float>(r * y), 0,
                                         static_cast<float>(s.data[i])};
     std::memcpy(cloud.data.data() + pos, point.data(), cloud.point_step);
     pos += cloud.point_step;

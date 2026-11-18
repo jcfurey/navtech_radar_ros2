@@ -519,7 +519,7 @@ class FftSweepAssembler(Node):
             keep = np.argsort(-intensities.astype(np.int32), kind='stable')[:self._max_points]
             bins = np.sort(bins[keep])
 
-        ranges = self._range_axis.metres(bins.astype(np.float64)).astype(np.float32)
+        ranges = self._range_axis.metres(bins.astype(np.float64))
         bearing = ros_bearing(angle, self._azimuth_offset)
         points = np.empty((bins.size, 4), dtype=np.float32)
         points[:, 0] = ranges * math.cos(bearing)

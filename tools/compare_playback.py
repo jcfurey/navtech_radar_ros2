@@ -220,6 +220,58 @@ def check_boundary_loss(bag):
           f'Both implementations emitted separate {n_old}- and {n_new}-row sweeps.')
 
 
+def check_filtered_cloud(cloud, fft, encoders, encoder_size, spacing, offset=0.,
+                         *, eight_bit=False, cfar=True):
+    """Predict the complete default planar cloud from the source rows, including its point budget."""
+    from sensor_msgs.msg import PointField
+    from sensor_msgs_py.point_cloud2 import read_points
+
+    names = ('x', 'y', 'z', 'intensity')
+    assert [(f.name, f.offset, f.datatype, f.count) for f in cloud.fields] == [
+        (name, 4*i, PointField.FLOAT32, 1) for i, name in enumerate(names)]
+    assert cloud.height == 1 and cloud.point_step == 16 and cloud.is_dense
+    assert len(cloud.data) == cloud.row_step == 16*cloud.width
+
+    threshold, excess = (24, 12.) if eight_bit else (22000, 3000.)
+    distances = np.arange(fft.shape[1])*spacing + offset
+    window = np.flatnonzero((distances >= 2.) & (distances <= 200.))
+    margin = 20 if cfar else 1
+    window = window[(window >= margin) & (window < fft.shape[1] - margin)]
+    training = np.r_[np.arange(-20, -4), np.arange(5, 21)]
+    expected = []
+    for ray in np.argsort(encoders, kind='stable'):
+        row = fft[ray]
+        levels = row[window]
+        peaks = window[(levels >= threshold) & (levels > row[window-1]) & (levels >= row[window+1])]
+        if cfar:
+            background = row[peaks[:, None] + training].mean(axis=1)
+            peaks = peaks[row[peaks] > background + excess]
+        # Select strongest first, break ties by range, and suppress neighbours
+        # directly in metres. The wire order within each spoke is near to far.
+        ranked = peaks[np.lexsort((peaks, -row[peaks].astype(int)))]
+        selected = []
+        while ranked.size and len(selected) < 48:
+            best = ranked[0]
+            selected.append(best)
+            ranked = ranked[1:]
+            if cfar:
+                ranked = ranked[np.abs(ranked - best)*spacing >= 0.5]
+        if selected:
+            bins = np.sort(selected)
+            r = distances[bins]
+            angle = -2*np.pi*int(encoders[ray])/encoder_size
+            expected.append(np.column_stack((r*np.cos(angle), r*np.sin(angle), row[bins])))
+
+    reference = np.concatenate(expected) if expected else np.empty((0, 3))
+    points = read_points(cloud, skip_nans=False)
+    assert len(reference) == len(points) == cloud.width
+    assert np.all(points['z'] == 0.)
+    np.testing.assert_array_equal(points['intensity'], reference[:, 2])
+    xy = np.column_stack((points['x'], points['y'])).astype(float)
+    np.testing.assert_allclose(xy, reference[:, :2], atol=2e-5, rtol=2e-7)
+    return np.linalg.norm(xy - reference[:, :2], axis=1).max(initial=0.)
+
+
 def check_recorded_exports(config, groups, results):
     """Read native ROS exports independently against turns with one recorded spoke per scan cell."""
     from laser_geometry import LaserProjection
@@ -239,7 +291,6 @@ def check_recorded_exports(config, groups, results):
             raise ValueError('Source check needs a complete turn with one spoke per scan cell')
         order = np.argsort(cells)
         fft = np.array([rows[i].data for i in order])
-        bearings = -native[order]
 
         def source_xy(ray, distance, intensity, angle):
             bins = np.rint(distance / resolution).astype(int)
@@ -249,14 +300,12 @@ def check_recorded_exports(config, groups, results):
             np.testing.assert_allclose(distance, radius, rtol=2e-6, atol=2e-5)
             return np.column_stack((radius * np.cos(angle), radius * np.sin(angle)))
 
-        points = read_points(cloud)
-        xy = np.column_stack((points['x'], points['y'])).astype(float)
-        ray = np.rint((-np.arctan2(xy[:, 1], xy[:, 0]) - native[0]) / step).astype(int) % count
-        expected = source_xy(ray, np.hypot(xy[:, 0], xy[:, 1]), points['intensity'], bearings[ray])
-        np.testing.assert_allclose(xy, expected, rtol=2e-6, atol=2e-5)
-        assert np.all(points['z'] == 0)
-        max_cloud_error = max(max_cloud_error, np.linalg.norm(xy - expected, axis=1).max(initial=0.))
-        total_cloud += len(points)
+        assert cloud.header == scan.header and cloud.header.frame_id == 'navtech'
+        assert cloud.header.stamp == rows[0].header.stamp
+        error = check_filtered_cloud(cloud, fft, [rows[i].azimuth for i in order],
+                                     config.EncoderSize, resolution)
+        max_cloud_error = max(max_cloud_error, error)
+        total_cloud += cloud.width
 
         ranges = np.asarray(scan.ranges, dtype=float)
         valid = np.flatnonzero(np.isfinite(ranges))

@@ -193,7 +193,7 @@ Clouds retain the strongest `max_points_per_spoke` peaks (0 means all), in range
 order. `scan_selection=nearest` chooses the nearest filtered peak before that
 cloud budget is applied; `strongest` instead chooses the largest FFT level.
 Thus a scan is useful for a compact planar view, while the cloud retains
-multiple reflectors along a bearing.
+multiple reflectors along a bearing. The source-bin checks cover both filters and the manufacturer’s two recorded cloud formats. [Filtered cloud validation](docs/playback_validation.md#filtered-point-cloud-validation)
 
 The scan keeps clockwise acquisition order. For `N` bearings,
 `angle_increment = −2π/N`, `angle_min` is the first acquired bearing in [0, 2π),

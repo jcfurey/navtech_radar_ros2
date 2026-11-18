@@ -34,6 +34,8 @@ install(PROGRAMS
 
 install(PROGRAMS scripts/recording_player.py DESTINATION lib/${PROJECT_NAME} RENAME recording_player)
 
+install(PROGRAMS navtech_recording/road_cloud.py DESTINATION lib/${PROJECT_NAME} RENAME road_cloud_adapter)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_ros REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)

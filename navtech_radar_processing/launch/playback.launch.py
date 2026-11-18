@@ -3,6 +3,7 @@ from pathlib import Path
 
 import yaml
 from navtech_recording.formats import identify
+from navtech_recording.road_cloud import is_road_cloud_export
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
@@ -34,6 +35,7 @@ def start(context):
                '/radar_data/point_cloud': '/navtech_radar/point_cloud',
                '/radar_data/laser_scan': '/navtech_radar/scan'}
     vendor_topics = []
+    road_cloud = False
     if bag:
         bag = str(Path(bag).expanduser())
         info_path = Path(bag)/'metadata.yaml'
@@ -41,6 +43,10 @@ def start(context):
             info = yaml.safe_load(info_path.read_text())['rosbag2_bagfile_information']
             names = [t['topic_metadata']['name'] for t in info['topics_with_message_count']]
             vendor_topics = [t for t in names if t in aliases]
+            if '/radar_data/point_cloud' in vendor_topics:
+                road_cloud = is_road_cloud_export(Path(bag), info)
+                if road_cloud:
+                    aliases['/radar_data/point_cloud'] = '/navtech_road_cloud_adapter/input'
     implementation = LaunchConfiguration('implementation').perform(context)
     sim_time = ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)
 
@@ -85,7 +91,12 @@ def start(context):
                       parameters=[common, params])
                  for pkg, exe, _, params in stages]
     fixed = LaunchConfiguration('frame_id').perform(context)
-    if vendor_topics and fixed == 'navtech':
+    if road_cloud:
+        nodes.append(Node(package='navtech_radar_driver', executable='road_cloud_adapter',
+                          remappings=[('~/input', aliases['/radar_data/point_cloud'])],
+                          parameters=[common, {'frame_id': param('frame_id')}],
+                          on_exit=check_playback_exit))
+    elif vendor_topics and fixed == 'navtech':
         fixed = {'/radar_data/b_scan_image': 'b_scan_image', '/radar_data/point_cloud': 'point_cloud',
                  '/radar_data/laser_scan': 'laser_frame'}[vendor_topics[0]]
     rviz_profile = 'recorded_products.rviz' if recorded_products or vendor_topics else 'radar.rviz'
@@ -98,6 +109,8 @@ def start(context):
         topics = vendor_topics or ['/Navtech/Configuration_Topic', '/Navtech/FFTData', '/tf', '/tf_static']
         cmd = ['ros2', 'bag', 'play', bag, '--clock', '100', '--delay', '2',
                '--rate', LaunchConfiguration('rate'), '--topics', *topics]
+        if road_cloud:
+            cmd.extend(['--wait-for-all-acked', '2000'])
         if vendor_topics:
             cmd.extend(['--remap', *(t + ':=' + aliases[t] for t in vendor_topics)])
         nodes.append(ExecuteProcess(cmd=cmd, output='screen', on_exit=check_playback_exit))

@@ -44,7 +44,7 @@ Each directory in `ROS2 Bags.zip` contains its own `metadata.yaml` and SQLite da
 
 The ROS 1 bag contains `/Navtech/Cartesian1` and `/Navtech/Polar` images, `/Navtech/FilteredPointcloud` and `/Navtech/scan3`. These are standard ROS 1 sensor message types. [Original download][road]
 
-The TAMU adapter consumes `nav_ross/msg/nav_msg` and `nav_ross/msg/HighPrecisionFFTData`. The playback launch also reads the original Colossus recordings and maps the manufacturer's standard ROS 1 and ROS 2 products to the driver topics. Use the original FFT capture for tests requiring the underlying intensity measurements. Quantitative comparison across the three bags requires time alignment and matching threshold, frame and range conventions. [Recording playback guide](recording-playback.md) · [Driver interfaces](../README.md#bag-playback)
+The TAMU adapter consumes `nav_ross/msg/nav_msg` and `nav_ross/msg/HighPrecisionFFTData`. The playback launch also reads the original Colossus recordings and maps the manufacturer's ROS 1 and ROS 2 products to the driver topics, including correction of the verified ROS 2 road cloud's units, handedness and scalar field counts. Use the original FFT capture for tests requiring the underlying intensity measurements. Quantitative comparison across the three bags requires time alignment and matching threshold, frame and range conventions. [Recording playback guide](recording-playback.md) · [Driver interfaces](../README.md#bag-playback)
 
 ## Research recordings
 

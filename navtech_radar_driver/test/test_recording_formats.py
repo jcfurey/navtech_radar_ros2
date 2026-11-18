@@ -116,3 +116,23 @@ def test_identify_unmodified_boreas_sequence_name(tmp_path):
     folder.mkdir(parents=True)
     (folder/'1752847243464332.png').touch()
     assert identify(folder) == identify(folder.parent) == 'boreas_rt'
+
+
+@pytest.mark.parametrize('endian', ['<', '>'])
+def test_road_export_cloud_is_metric_and_scalar(endian):
+    from navtech_recording.road_cloud import normalize_road_cloud
+    from sensor_msgs.msg import PointCloud2, PointField
+
+    values = np.array([[0, 100, 0, 77], [-50, 0, 0, 99]], dtype=endian+'f4')
+    fields = [PointField(name=k, offset=i*4, datatype=PointField.FLOAT32, count=2)
+              for i, k in enumerate(('x', 'y', 'z', 'intensity'))]
+    m = PointCloud2(width=2, height=1, point_step=16, row_step=32, fields=fields,
+                    data=values.tobytes(), is_bigendian=endian == '>', is_dense=True)
+    m.header.stamp.sec = 123
+    normalized = normalize_road_cloud(m, 'radar')
+    assert normalized.header.frame_id == 'radar' and normalized.header.stamp.sec == 123
+    assert [f.count for f in m.fields] == [1]*4
+    np.testing.assert_allclose(np.frombuffer(m.data, dtype=endian+'f4').reshape(-1, 4),
+                               [[0, -4.38, 0, 77], [-2.19, 0, 0, 99]], atol=1e-6)
+    with pytest.raises(ValueError, match='layout'):
+        normalize_road_cloud(m, 'radar')

@@ -358,3 +358,29 @@ reference byte-for-byte on all 192 turns. The odometry turn again produced
 a +20.700° scene shift for −20.314° of vehicle yaw. These residuals in metres
 measure conversion arithmetic.
 Physical accuracy also depends on the sensor, timing and mounting calibration.
+
+## Filtered point cloud validation
+
+The native driver publishes an unordered `sensor_msgs/msg/PointCloud2` with four scalar FLOAT32 fields at byte offsets 0, 4, 8 and 12. The ROS consumer checked height 1, field counts, point and row strides, payload length, density, frame, timestamp, intensity and planar z. The reference independently selected every expected bin from the source FFT using the configured range gates and local maxima. For CFAR it averaged the 16 training cells on each side outside the four guard cells, applied the additive threshold and minimum separation, then retained the strongest 48 peaks per spoke. The comparison checked cardinality and ordered point values, so extra and omitted detections both fail. Cartesian coordinates are calculated in double precision and rounded once into the output FLOAT32 fields. [PointCloud2 definition](https://github.com/ros2/common_interfaces/blob/rolling/sensor_msgs/msg/PointCloud2.msg) · [ROS body axes and units](https://github.com/ros-infrastructure/rep/blob/master/rep-0103.rst)
+
+| Input and filter | Rotations checked | Expected and received points | Maximum XY error vs source geometry |
+| --- | ---: | ---: | ---: |
+| RADIATE, Boreas Road Trip, MAS10 sea fog, Thames, MulRan ParkingLot, Navtech road (8-bit), threshold | 82 | 1,404,703 | 0.0000107 m |
+| Same 8-bit rotations, CFAR | 82 | 1,161,827 | 0.0000107 m |
+| TAMU route 1/run 2 (16-bit), CFAR | 32 | 25,874 | 0.0000049 m |
+
+A check against RADIATE's independently supplied Cartesian PNGs also tested horizontal orientation. At the projected locations of CFAR detections, the median per-frame correlation between point intensity and the published image pixel was 0.944 across all 18 frames. Reflecting the same points left-to-right gave −0.054. These checks establish how recorded returns are filtered and projected. Assessing obstacle precision and recall requires labelled targets, and absolute position accuracy depends on sensor and mounting calibration. [RADIATE sample](https://github.com/marcelsheeny/radiate_sdk/tree/b1d5de559784b3aa57bea99b00c13d495d79e846/data/radiate/tiny_foggy)
+
+### Navtech road exports
+
+- A subscriber decoded all 1,541 ROS 1 filtered clouds, totaling 91,182,883 finite planar points. Headers, field definitions and full padded point buffers matched the original ROS 1 messages. In 32 time-aligned clouds, sampled filtered intensities correlated with the original radar FFT at the measured range and ROS bearing (median Pearson correlation 0.99993). The vendor's filtered intensity scale differs from the raw FFT.
+- All 1,295 clouds in the manufacturer’s ROS 2 thresholded export declared their four scalar field counts as the number of points. Their XY radii reached 1,023 bins. The paired COLRAW configuration identifies 1,024 bins, 0.0438 m/bin, unity gain and zero range offset. On the exporter's nominal bearing grid, **all 27,982,007 nonzero-range returns** matched the raw intensity at the corresponding bin and clockwise bearing. The remaining 517,245 points are at the origin, where XY gives no bearing.
+- Over localhost DDS at 8× playback, a standard ROS subscriber decoded all 28,499,252 corrected points in order, with exact source intensities and timestamps. Maximum radius was 44.8074 m. The maximum horizontal residual relative to the source bin and nominal bearing was 0.0000141 m. Three recorded clouds contained a different number of points from selecting every FFT sample above 70 in the paired rotation. Playback preserves the vendor's recorded selection. [Road cloud playback](recording-playback.md#navtech-road-cloud-coordinates)
+
+From a sourced workspace and the driver checkout, use the two original road files and the converted TAMU bag to reproduce the source checks.
+
+```bash
+python3 tools/check_road_cloud.py /path/to/RadarDataFromVehicle_ThresholdedPointCloud /path/to/road.colraw
+ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+  python3 tools/compare_playback.py /path/to/tamu_mcap --rotations 32 --check-exports
+```

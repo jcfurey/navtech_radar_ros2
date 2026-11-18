@@ -8,7 +8,7 @@ import time
 from uuid import uuid4
 
 from ament_index_python.packages import get_package_prefix
-from compare_playback import compare, run_pipeline, stop
+from compare_playback import check_filtered_cloud, compare, run_pipeline, stop
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
 from nav_ross.msg import HighPrecisionFFTData, nav_msg
@@ -246,7 +246,7 @@ def test_file_launch_keeps_chirps_and_publishes_last_partial(tmp_path):
     folder = tmp_path/'boreas-2025-07-18-10-00'/'radar'
     folder.mkdir(parents=True)
     first_usec = 1752847243464332
-    encoders = np.array([2800, 4200, 0], dtype='<u2')
+    encoders = np.array([2397, 4200, 0], dtype='<u2')
     expected = []
     for i in range(2):
         image = np.zeros((3, 11+96), np.uint8)
@@ -254,25 +254,30 @@ def test_file_launch_keeps_chirps_and_publishes_last_partial(tmp_path):
         image[:, :8] = usec.view(np.uint8).reshape(3, 8)
         image[:, 8:10] = encoders.view(np.uint8).reshape(3, 2)
         image[:, 10] = [0, 255, 0]
-        image[:, 11+80] = [90+i, 120+i, 240+i]
+        image[:, 11+65] = [81+i, 102+i, 203+i]
+        image[:, 11+80] = [90+i, 120+i, 240+i]  # No complete outer CFAR training window.
         assert cv2.imwrite(str(folder/f'{usec[0]}.png'), image)
         expected.append(image[[2, 0, 1], 11:])
 
     with rclpy.init(), ExitStack() as cleanup:
         node = rclpy.create_node('fixture_' + uuid4().hex)
         cleanup.callback(node.destroy_node)
-        received = []
+        received, clouds = [], []
         node.create_subscription(FftSweep, '/navtech_radar/fft/sweep', received.append, 4)
+        node.create_subscription(PointCloud2, '/navtech_radar/point_cloud', clouds.append, qos_profile_sensor_data)
         child = subprocess.Popen(['ros2', 'launch', 'navtech_radar_processing', 'playback.launch.py',
                                   'recording:=' + str(folder)])
         cleanup.callback(stop, child)
         deadline = time.monotonic() + 15
-        while len(received) < 2 and time.monotonic() < deadline and child.poll() is None:
+        while min(len(received), len(clouds)) < 2 and time.monotonic() < deadline and child.poll() is None:
             rclpy.spin_once(node, timeout_sec=0.05)
-        assert len(received) == len(expected)
+        assert len(received) == len(clouds) == len(expected)
         for i, (sweep, rows) in enumerate(zip(received, expected)):
             assert sweep.sample_bit_depth == 8 and sweep.image.encoding == 'mono16'
             assert sweep.range_resolution == pytest.approx(0.04381)
-            assert list(sweep.encoder_values) == [0, 2800, 4200]
+            assert list(sweep.encoder_values) == [0, 2397, 4200]
             assert sweep.header.stamp.sec*10**9 + sweep.header.stamp.nanosec == (first_usec+i*250000)*1000
             np.testing.assert_array_equal(np.frombuffer(sweep.image.data, '<u2').reshape(3, 96), rows)
+            cloud = clouds[i]
+            assert cloud.width == 3 and cloud.header == sweep.header
+            check_filtered_cloud(cloud, rows, sweep.encoder_values, 5600, 0.04381, -0.31, eight_bit=True)
