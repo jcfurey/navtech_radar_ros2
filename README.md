@@ -43,7 +43,9 @@ when the corresponding transforms are available. Robot-specific mounting and
 the full TAMU viewer belong to the surrounding TAMU workspace.
 
 The radar model, recorded geometry and manufacturer datasheet are in the
-[hardware reference](docs/cts350x.md). Credit for the SDK, dataset, legacy
+[hardware reference](docs/cts350x.md). The [product and recording inventory](docs/radar-products-and-recordings.md)
+links Navtech's radar families to public sensor captures and identifies the formats available for playback and export comparisons.
+Credit for the SDK, dataset, legacy
 interfaces and related projects is in [Sources and acknowledgments](THIRD_PARTY.md).
 Navtech lists this implementation in its [published works directory](https://navtechradar.atlassian.net/wiki/spaces/IA/pages/2408480879/Published+works+including+Navtech+Radar).
 
