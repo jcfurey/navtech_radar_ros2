@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.10)
 project(navtech_radar_driver)
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
+ament_python_install_package(navtech_recording)
 
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
@@ -29,6 +31,8 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
   RENAME legacy_bag_driver_py
 )
+
+install(PROGRAMS scripts/recording_player.py DESTINATION lib/${PROJECT_NAME} RENAME recording_player)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_ros REQUIRED)

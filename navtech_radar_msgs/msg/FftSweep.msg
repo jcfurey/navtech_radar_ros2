@@ -1,6 +1,7 @@
 # One assembled radar revolution with all per-spoke metadata retained.
 
-# Sensor timestamp of the first received spoke and radar frame.
+# Acquisition time of the first received spoke and radar frame. File playback
+# uses the recorder or frame timestamp when the sensor supplied no row time.
 std_msgs/Header header
 builtin_interfaces/Time end_stamp
 

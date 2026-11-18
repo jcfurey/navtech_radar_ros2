@@ -20,6 +20,7 @@ and an initialized rosdep. Run the following in an empty workspace.
 source /opt/ros/lyrical/setup.bash
 mkdir -p src
 git clone --branch cpp https://github.com/jcfurey/navtech_radar_ros2.git src/navtech_radar_ros2
+sudo apt-get install python3-rosbags
 rosdep install --from-paths src --ignore-src --rosdistro lyrical -r -y
 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 source install/setup.bash
@@ -35,7 +36,15 @@ and starts a radar-frame RViz profile when requested.
 ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap rviz:=true
 ```
 
-Omit `bag` for an external player. Options include `cloud`, `scan`,
+Use `recording:=` for Navtech COLRAW, the Thames CPR with its decoded companion, vendor ROS 1 and ROS 2 sensor products, and the Oxford, RADIATE, Boreas, MulRan and MUSES radar datasets.
+
+```bash
+ros2 launch navtech_radar_processing playback.launch.py recording:=/path/to/radiate/tiny_foggy rviz:=true
+```
+
+For the input path and playback options for each collection, see the [recording playback guide](docs/recording-playback.md).
+
+Omit both `bag` and `recording` for an external TAMU player. Options include `cloud`, `scan`,
 `peak_selection`, `scan_selection`, `rate`, and `implementation:=python`
 for the reference nodes. `frame_id` sets the adapter radar frame and the RViz
 fixed frame (default `navtech`). `robot_frame` and `heading_frame` enable the optional TF overlays
@@ -70,7 +79,7 @@ topics without changing the source bag:
 
 The installed executables `legacy_bag_driver`, `fft_sweep_assembler` and
 `fft_sweep_visualizer` are C++. Each has a Python reference executable with the
-suffix `_py`. The launch argument `implementation:=python` selects all three
+suffix `_py`. For TAMU bags, `implementation:=python` selects all three
 references. Both implementations accept the same ROS parameters and topic remaps.
 
 For faster playback, `implementation:=cpp_composed` loads the three C++ nodes

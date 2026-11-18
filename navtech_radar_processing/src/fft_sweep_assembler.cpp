@@ -2,6 +2,7 @@
 #include "cloud_deskew.hpp"
 #include "navtech_radar_msgs/msg/fft_sweep.hpp"
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
+#include "navtech_radar_msgs/msg/recorded_rotation.hpp"
 #include "planar_products.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
@@ -14,6 +15,7 @@
 
 namespace radar {
 using Config = navtech_radar_msgs::msg::RadarConfiguration;
+using Recording = navtech_radar_msgs::msg::RecordedRotation;
 using Sweep = navtech_radar_msgs::msg::FftSweep;
 using Image = sensor_msgs::msg::Image;
 
@@ -86,6 +88,24 @@ public:
     scans_ = create_publisher<Scan>(
         param<std::string>("scan_topic", "navtech_radar/scan"),
         rclcpp::SensorDataQoS());
+    if (param("recorded_input", false)) {
+      recorded_settings_ = settings_;
+      recorded_settings_.threshold = param("recorded_threshold_8bit", 24);
+      recorded_settings_.cfar_offset = param("recorded_cfar_offset_8bit", 12.0);
+      if (recorded_settings_.threshold < 0 ||
+          recorded_settings_.threshold > 255 ||
+          !std::isfinite(recorded_settings_.cfar_offset) ||
+          recorded_settings_.cfar_offset < 0)
+        throw std::invalid_argument("invalid 8-bit detector settings");
+      config_output_ = create_publisher<Config>(
+          "navtech_radar/configuration", rclcpp::QoS(1).transient_local());
+      spoke_output_ = create_publisher<Spoke>("navtech_radar/fft/spoke",
+                                              rclcpp::SensorDataQoS());
+      recordings_ = create_subscription<Recording>(
+          "navtech_radar/recording/rotation", 4,
+          [this](Recording::ConstSharedPtr rotation) { replay(*rotation); });
+      return;
+    }
     configs_ = create_subscription<Config>(
         param<std::string>("configuration_topic",
                            "navtech_radar/configuration"),
@@ -132,9 +152,83 @@ private:
       return;
     finish();
     config_ = std::move(c);
+    if (config_output_)
+      config_output_->publish(*config_);
     axis_ = axis;
     resolution_ = config_->range_resolution;
     count_ = config_->azimuth_samples;
+  }
+
+  // File readers already know precisely where a frame ends, including at EOF.
+  // Keep its acquisition order until finish() applies the normal encoder sort.
+  void replay(const Recording &r) {
+    const auto &img = r.image;
+    const auto &cfg = r.configuration;
+    const size_t n = img.height;
+    const bool eight = cfg.sample_bit_depth == 8;
+    auto size_ok = [n](const auto &v) { return v.empty() || v.size() == n; };
+    auto times_ok = [&](const auto &v) {
+      return size_ok(v) && std::all_of(v.begin(), v.end(), [](uint64_t t) {
+               return t / 1000000000ULL <= INT32_MAX;
+             });
+    };
+    if (!n || n > size_t(max_rows_) || !img.width ||
+        img.width != cfg.range_bins || img.width > size_t(max_bins_) ||
+        !cfg.encoder_size || !cfg.azimuth_samples ||
+        cfg.azimuth_samples > cfg.encoder_size ||
+        cfg.azimuth_samples > max_rows_ || !cfg.configuration_version ||
+        !(std::isfinite(cfg.range_resolution) && cfg.range_resolution > 0) ||
+        !RangeAxis::from_config(cfg).valid(cfg.range_bins) ||
+        !valid_frame(img.header.frame_id) ||
+        cfg.header.frame_id != img.header.frame_id ||
+        img.header.stamp.nanosec >= 1000000000u ||
+        !(eight || cfg.sample_bit_depth == 16) ||
+        img.encoding != (eight ? "mono8" : "mono16") ||
+        img.step != img.width * (eight ? 1 : 2) ||
+        img.data.size() != n * img.step || r.encoder_values.size() != n ||
+        !size_ok(r.sweep_counters) || !times_ok(r.sensor_ns) ||
+        !times_ok(r.receipt_ns) || !size_ok(r.row_flags) ||
+        *std::max_element(r.encoder_values.begin(), r.encoder_values.end()) >=
+            cfg.encoder_size) {
+      RCLCPP_WARN(get_logger(), "Rejected inconsistent recorded rotation");
+      return;
+    }
+    configure(std::make_shared<Config>(cfg));
+    const bool send_spokes = spoke_output_->get_subscription_count() > 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!r.row_flags.empty() && r.source_format != "boreas_rt" &&
+          !r.row_flags[i])
+        continue;
+      auto s = std::make_unique<Spoke>();
+      s->header = img.header;
+      const uint64_t sensor = r.sensor_ns.empty() ? 0 : r.sensor_ns[i];
+      const uint64_t receipt = r.receipt_ns.empty() ? 0 : r.receipt_ns[i];
+      if (receipt)
+        s->host_stamp = rclcpp::Time(static_cast<int64_t>(receipt));
+      if (sensor || receipt)
+        s->header.stamp =
+            rclcpp::Time(static_cast<int64_t>(sensor ? sensor : receipt));
+      s->ntp_seconds = sensor / 1000000000ULL;
+      s->ntp_split_seconds = sensor % 1000000000ULL;
+      s->configuration_version = cfg.configuration_version;
+      s->sample_bit_depth = cfg.sample_bit_depth;
+      s->sweep_counter = r.sweep_counters.empty() ? 0 : r.sweep_counters[i];
+      s->azimuth = r.encoder_values[i];
+      s->azimuth_angle = tau * s->azimuth / cfg.encoder_size;
+      const auto *row = img.data.data() + i * img.step;
+      if (eight)
+        s->data.assign(row, row + img.width);
+      else {
+        s->data.resize(img.width);
+        for (size_t j = 0; j < img.width; ++j)
+          s->data[j] = img.is_bigendian ? row[2 * j] * 256 + row[2 * j + 1]
+                                        : row[2 * j + 1] * 256 + row[2 * j];
+      }
+      if (send_spokes)
+        spoke_output_->publish(*s);
+      pending_.push_back(std::move(s));
+    }
+    finish();
   }
 
   bool crossed_zero(const Spoke &previous, const Spoke &current,
@@ -332,7 +426,10 @@ private:
       return;
     std::vector<SpokePoints> spans;
     for (const auto &s : pending_) {
-      const auto &bins = detector_.select(s->data, axis_, settings_);
+      const auto &bins = detector_.select(
+          s->data, axis_,
+          recordings_ && s->sample_bit_depth == 8 ? recorded_settings_
+                                                  : settings_);
       if (scan)
         scan->add(*s, bins, axis_, settings_.nearest);
       if (cloud && !bins.empty()) {
@@ -360,7 +457,10 @@ private:
   int count_, minimum_, max_rows_, max_bins_;
   bool partial_, publish_cloud_, publish_scan_;
   uint32_t sequence_{};
-  DetectionSettings settings_;
+  DetectionSettings settings_, recorded_settings_;
+  rclcpp::Publisher<Config>::SharedPtr config_output_;
+  rclcpp::Publisher<Spoke>::SharedPtr spoke_output_;
+  rclcpp::Subscription<Recording>::SharedPtr recordings_;
   RangeAxis axis_;
   std::unique_ptr<CloudDeskew> deskew_;
   PeakDetector detector_;

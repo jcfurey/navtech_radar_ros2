@@ -11,6 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FftSpoke.msg"
   "msg/FftSweep.msg"
   "msg/RadarConfiguration.msg"
+  "msg/RecordedRotation.msg"
   DEPENDENCIES builtin_interfaces sensor_msgs std_msgs
 )
 
