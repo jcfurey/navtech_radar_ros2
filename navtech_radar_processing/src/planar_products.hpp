@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -47,8 +48,7 @@ struct DetectionSettings {
   bool cfar, nearest;
 };
 
-// Reuse scratch space across spokes. A prefix sum gives the two training
-// windows in constant time, with guard cells and the peak excluded.
+// Reuse scratch space across spokes.
 class PeakDetector {
 public:
   const std::vector<int> &select(const std::vector<uint16_t> &samples,
@@ -62,42 +62,66 @@ public:
     bins_.clear();
     if (first >= end)
       return bins_;
-    if (p.cfar) {
-      sums_.resize(width + 1);
-      sums_[first - margin] = 0;
-      for (int i = first - margin; i < end + margin; ++i)
-        sums_[i + 1] = sums_[i] + samples[i];
-    }
-    for (int i = first; i < end; ++i) {
-      const auto value = samples[i];
-      if (value < p.threshold || value <= samples[i - 1] ||
-          value < samples[i + 1])
+    const auto *data = samples.data();
+    constexpr int block_size = 32;
+    for (int begin = first; begin < end; begin += block_size) {
+      const int block_end = std::min(begin + block_size, end);
+      if (*std::max_element(data + begin, data + block_end) < p.threshold)
         continue;
-      if (p.cfar) {
-        const auto sum = (sums_[i - p.guard] - sums_[i - margin]) +
-                         (sums_[i + margin + 1] - sums_[i + p.guard + 1]);
-        if (value <= double(sum) / (2 * p.training) + p.cfar_offset)
-          continue;
+      for (int i = begin; i < block_end; ++i) {
+        const auto value = data[i];
+        if (value >= p.threshold && value > data[i - 1] && value >= data[i + 1])
+          bins_.push_back(i);
       }
-      bins_.push_back(i);
+    }
+    if (p.cfar && !bins_.empty()) {
+      // Sum the training windows directly for sparse peaks. A prefix sum
+      // saves work once their combined length exceeds the search interval.
+      const bool dense = bins_.size() * (2 * p.training) >
+                         static_cast<size_t>(end - first + 2 * margin);
+      if (dense) {
+        sums_.resize(width + 1);
+        sums_[first - margin] = 0;
+        for (int i = first - margin; i < end + margin; ++i)
+          sums_[i + 1] = sums_[i] + samples[i];
+      }
+      auto rejected = [&](int i) {
+        const auto sum =
+            dense ? (sums_[i - p.guard] - sums_[i - margin]) +
+                        (sums_[i + margin + 1] - sums_[i + p.guard + 1])
+                  : std::accumulate(data + i - margin, data + i - p.guard, 0u) +
+                        std::accumulate(data + i + p.guard + 1,
+                                        data + i + margin + 1, 0u);
+        return data[i] <= double(sum) / (2 * p.training) + p.cfar_offset;
+      };
+      bins_.erase(std::remove_if(bins_.begin(), bins_.end(), rejected),
+                  bins_.end());
     }
     const int separation = static_cast<int>(
         std::ceil(std::min(double(width), p.separation / axis.spacing)));
     if (p.cfar && separation > 1 && bins_.size() > 1) {
-      std::sort(bins_.begin(), bins_.end(), [&](int a, int b) {
-        return samples[a] == samples[b] ? a < b : samples[a] > samples[b];
-      });
-      blocked_.assign(width, false);
-      auto kept = bins_.begin();
-      for (int i : bins_) {
+      // Sorting integer keys keeps equal-strength peaks in ascending bin order.
+      // Both the FFT level and a bin index fit in 16 bits on the wire.
+      priority_.clear();
+      for (int i : bins_)
+        priority_.push_back((uint32_t(UINT16_MAX - samples[i]) << 16) |
+                            uint32_t(i));
+      std::sort(priority_.begin(), priority_.end());
+      enum : uint8_t { available, suppressed, retained };
+      blocked_.assign(width, available);
+      for (uint32_t key : priority_) {
+        const int i = key & UINT16_MAX;
         if (blocked_[i])
           continue;
-        *kept++ = i;
         std::fill(blocked_.begin() + std::max(0, i - separation + 1),
-                  blocked_.begin() + std::min(width, i + separation), true);
+                  blocked_.begin() + std::min(width, i + separation),
+                  suppressed);
+        blocked_[i] = retained;
       }
-      bins_.erase(kept, bins_.end());
-      std::sort(bins_.begin(), bins_.end());
+      bins_.erase(
+          std::remove_if(bins_.begin(), bins_.end(),
+                         [&](int i) { return blocked_[i] != retained; }),
+          bins_.end());
     }
     return bins_;
   }
@@ -106,6 +130,7 @@ private:
   std::vector<int> bins_;
   std::vector<uint64_t> sums_;
   std::vector<uint8_t> blocked_;
+  std::vector<uint32_t> priority_;
 };
 
 inline bool big_endian() {

@@ -4,21 +4,25 @@ project(navtech_radar_driver)
 find_package(ament_cmake REQUIRED)
 
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(nav_ross REQUIRED)
 find_package(navtech_radar_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 
-add_executable(legacy_bag_driver src/legacy_bag_driver.cpp)
-target_compile_features(legacy_bag_driver PRIVATE cxx_std_17)
-target_link_libraries(legacy_bag_driver PRIVATE
+add_library(legacy_bag_driver_component SHARED src/legacy_bag_driver.cpp)
+target_compile_features(legacy_bag_driver_component PRIVATE cxx_std_17)
+target_link_libraries(legacy_bag_driver_component PRIVATE
+  rclcpp_components::component
   rclcpp::rclcpp
   nav_ross::nav_ross__rosidl_typesupport_cpp
   navtech_radar_msgs::navtech_radar_msgs__rosidl_typesupport_cpp
   diagnostic_msgs::diagnostic_msgs__rosidl_typesupport_cpp
   rcl_interfaces::rcl_interfaces__rosidl_typesupport_cpp
 )
-install(TARGETS legacy_bag_driver DESTINATION lib/${PROJECT_NAME})
+rclcpp_components_register_node(legacy_bag_driver_component
+  PLUGIN "LegacyBagDriver" EXECUTABLE legacy_bag_driver)
+install(TARGETS legacy_bag_driver_component DESTINATION lib)
 
 install(PROGRAMS
   scripts/legacy_bag_driver.py

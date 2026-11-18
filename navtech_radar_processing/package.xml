@@ -8,6 +8,7 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
 
   <depend>navtech_radar_msgs</depend>
   <exec_depend>python3-numpy</exec_depend>
@@ -33,6 +34,10 @@
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_cmake_ros</test_depend>
   <test_depend>nav_ross</test_depend>
+  <test_depend>cv_bridge</test_depend>
+  <test_depend>laser_geometry</test_depend>
+  <test_depend>sensor_msgs_py</test_depend>
+  <test_depend>ros2launch</test_depend>
   <test_depend>geometry_msgs</test_depend>
   <test_depend>python3-pytest</test_depend>
 

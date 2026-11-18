@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_components/register_node_macro.hpp"
 #include "tf2/exceptions.hpp"
 #include "tf2_ros/buffer.hpp"
 #include "tf2_ros/transform_listener.hpp"
@@ -15,8 +16,8 @@
 namespace radar {
 class SweepVisualizer final : public rclcpp::Node {
 public:
-  SweepVisualizer()
-      : Node("navtech_fft_sweep_visualizer"),
+  explicit SweepVisualizer(const rclcpp::NodeOptions &options)
+      : Node("navtech_fft_sweep_visualizer", options),
         renderer_(
             {param("min_range", 2.0), param("max_range", 150.0),
              param<int64_t>("image_width", 1000),
@@ -119,8 +120,4 @@ private:
 };
 } // namespace radar
 
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<radar::SweepVisualizer>());
-  rclcpp::shutdown();
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(radar::SweepVisualizer)

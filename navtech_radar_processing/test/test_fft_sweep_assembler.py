@@ -241,6 +241,28 @@ def test_backward_sensor_time_resets_partial_sweep(make_node):
     assert not node._sweep_publisher.messages
 
 
+@pytest.mark.parametrize('stamp_ns,encoder,counter,rate,retained', [
+    (99_900_000, 180, 0, 4, True),    # 100 µs local inversion across counter rollover
+    (68_750_000, 180, 0, 8, False),   # a full nominal spoke period backward
+    (50_000_000, 180, 0, 4, False),   # reaches the timestamp two packets back
+    (99_900_000, 225, 0, 4, False),   # ambiguous encoder advance of 1.5 cells
+    (99_900_000, 180, 1, 4, False),   # skipped packet number
+    (99_900_000, 180, 0, 0, False),   # missing rotation rate
+])
+def test_isolated_stamp_inversion(make_node, stamp_ns, encoder, counter, rate, retained):
+    node = make_node()
+    cfg = configuration()
+    cfg.expected_rotation_rate = rate
+    node._configuration_callback(cfg)
+    for azimuth, tick, ns in [(0, 65534, 50_000_000), (90, 65535, 100_000_000),
+                               (encoder, counter, stamp_ns)]:
+        ray = spoke(azimuth, counter=tick, version=1)
+        ray.header.stamp.nanosec = ns
+        node._spoke_callback(ray)
+    assert len(node._spokes) == (3 if retained else 1)
+    assert node._spokes[-1].stamp.nanosec == stamp_ns
+
+
 def test_no_wrap_stream_remains_bounded(make_node):
     node = make_node(expected_spokes=4, max_buffered_spokes=4, max_range_bins=4)
     for i in range(20):

@@ -4,6 +4,7 @@ project(navtech_radar_processing)
 find_package(ament_cmake REQUIRED)
 
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(navtech_radar_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
@@ -12,25 +13,31 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 
-add_executable(fft_sweep_assembler src/fft_sweep_assembler.cpp)
-target_compile_features(fft_sweep_assembler PRIVATE cxx_std_17)
-target_link_libraries(fft_sweep_assembler PRIVATE
+add_library(fft_sweep_assembler_component SHARED src/fft_sweep_assembler.cpp)
+target_compile_features(fft_sweep_assembler_component PRIVATE cxx_std_17)
+target_link_libraries(fft_sweep_assembler_component PRIVATE
+  rclcpp_components::component
   tf2_geometry_msgs::tf2_geometry_msgs tf2_ros::tf2_ros
   rclcpp::rclcpp
   navtech_radar_msgs::navtech_radar_msgs__rosidl_typesupport_cpp
   sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
   rcl_interfaces::rcl_interfaces__rosidl_typesupport_cpp
 )
-add_executable(fft_sweep_visualizer src/fft_sweep_visualizer.cpp src/sweep_renderer.cpp)
-target_compile_features(fft_sweep_visualizer PRIVATE cxx_std_17)
-target_link_libraries(fft_sweep_visualizer PRIVATE
+rclcpp_components_register_node(fft_sweep_assembler_component
+  PLUGIN "radar::SweepAssembler" EXECUTABLE fft_sweep_assembler)
+add_library(fft_sweep_visualizer_component SHARED src/fft_sweep_visualizer.cpp src/sweep_renderer.cpp)
+target_compile_features(fft_sweep_visualizer_component PRIVATE cxx_std_17)
+target_link_libraries(fft_sweep_visualizer_component PRIVATE
+  rclcpp_components::component
   rclcpp::rclcpp
   navtech_radar_msgs::navtech_radar_msgs__rosidl_typesupport_cpp
   sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
   rcl_interfaces::rcl_interfaces__rosidl_typesupport_cpp
   tf2::tf2 tf2_ros::tf2_ros opencv_core opencv_imgproc
 )
-install(TARGETS fft_sweep_assembler fft_sweep_visualizer DESTINATION lib/${PROJECT_NAME})
+rclcpp_components_register_node(fft_sweep_visualizer_component
+  PLUGIN "radar::SweepVisualizer" EXECUTABLE fft_sweep_visualizer)
+install(TARGETS fft_sweep_assembler_component fft_sweep_visualizer_component DESTINATION lib)
 
 install(PROGRAMS
   scripts/fft_sweep_assembler.py

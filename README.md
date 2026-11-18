@@ -71,6 +71,14 @@ The installed executables `legacy_bag_driver`, `fft_sweep_assembler` and
 suffix `_py`. The launch argument `implementation:=python` selects all three
 references. Both implementations accept the same ROS parameters and topic remaps.
 
+For faster playback, `implementation:=cpp_composed` loads the three C++ nodes
+into one three-thread ROS component container. It passes spokes and sweeps
+between the nodes in memory. External subscribers can read the same topics.
+
+```bash
+ros2 launch navtech_radar_processing playback.launch.py implementation:=cpp_composed bag:=/path/to/ros2_mcap
+```
+
 ## Enhanced images
 
 `navtech_radar_processing/fft_sweep_visualizer` optionally consumes the sweep
@@ -275,11 +283,16 @@ sensor timestamps are available, the elapsed time must also support that crossin
 This allows the two partial sweeps to be published separately or evaluated
 individually in strict mode. The counter wraps at 65,536. [Navtech FFT packet format](https://navtechradar.atlassian.net/wiki/spaces/IA/pages/2061009217)
 
-A backward sensor timestamp or a forward gap of at least one configured
-revolution discards the pending sweep and begins a new one at the incoming
-spoke. When rotation rate is unknown, the fallback boundary is a gap longer
-than `fallback_max_spoke_gap_sec` (default 1.0 s). A pending final sweep is
-published only when a subsequent wrap or geometry change closes it.
+A forward gap of at least one configured revolution starts a new sweep. Backward
+sensor time also starts a new sweep, with one exception observed in the TAMU
+recording. Within a turn, a single timestamp can fall between the two preceding
+positive timestamps by stepping back less than one nominal spoke interval. The
+assembler retains it when the packet counter advances by one and the encoder
+advances by one angular cell within a half-cell tolerance. The raw timestamps
+preserve the inversion and the scan reports irregular timing. When rotation rate
+is unknown, backward time resets assembly and the forward-gap limit is
+`fallback_max_spoke_gap_sec` (default 1.0 s). A subsequent wrap or geometry
+change closes the pending final sweep.
 
 `max_buffered_spokes` (2048) and `max_range_bins` (16384) bound retained raw data
 to at most 64 MiB with the defaults, excluding DDS queues and output buffers.
@@ -316,6 +329,11 @@ ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
 ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
   python3 src/navtech_radar_ros2/tools/compare_images.py /path/to/ros2_mcap --rotations 32
 ```
+
+The paced stress test measures throughput and latency with all six products
+subscribed. It checks every raw row while the feeder continues at the requested
+rate. For the independent export check, add `--check-exports` to
+`compare_playback.py` on complete recorded turns. [Results and reproduction commands](docs/playback_validation.md#paced-load-and-export-accuracy)
 
 The registered tests also exercise both installed implementations with a small
 deterministic fixture. They run without a bag or radar hardware.

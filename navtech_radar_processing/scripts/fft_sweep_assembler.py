@@ -290,6 +290,18 @@ class FftSweepAssembler(Node):
             return True
         return abs(gap_ns * 1e-9 * self._rotation_rate - ticks / self._encoder_size) < 0.5
 
+    def _local_stamp_inversion(self, message, gap_ns):
+        if len(self._spokes) < 2 or not self._rotation_rate:
+            return False
+        previous = self._spokes[-1]
+        earlier = self._spokes[-2].stamp
+        current = message.header.stamp
+        cells = (message.azimuth - previous.azimuth) * self._expected_spokes / self._encoder_size
+        return (-gap_ns * self._rotation_rate * self._expected_spokes < 1_000_000_000
+                and (0, 0) < (earlier.sec, earlier.nanosec) < (current.sec, current.nanosec)
+                and (message.sweep_counter - previous.sweep_counter) % 65536 == 1
+                and abs(cells - 1.0) < 0.5)
+
     def _spoke_callback(self, message: FftSpoke) -> None:
         angle = float(message.azimuth_angle)
         if (
@@ -338,7 +350,7 @@ class FftSweepAssembler(Node):
                       + message.header.stamp.nanosec - previous.stamp.nanosec)
             forward_jump = (gap_ns * self._rotation_rate >= 1_000_000_000 if self._rotation_rate
                             else gap_ns * 1e-9 > self._fallback_gap)
-            if gap_ns < 0 or forward_jump:
+            if (gap_ns < 0 and not self._local_stamp_inversion(message, gap_ns)) or forward_jump:
                 self._reset_sweep()
                 if self._deskew:
                     self._deskew.clear()

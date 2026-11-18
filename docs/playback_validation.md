@@ -289,3 +289,72 @@ compares the two implementations' scan and cloud outputs.
 ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
   python3 tools/compare_playback.py /path/to/ros2_mcap --check-boundary-loss
 ```
+
+## Paced load and export accuracy
+
+The November 2026 run used a Release build on ROS 2 Lyrical with Cyclone DDS
+and a Ryzen Threadripper 3970X. The feeder replayed pre-serialized legacy FFT
+spokes from TAMU route 1/run 2 in eight-packet batches. Sensor timestamps
+retained their recorded values at every replay rate. An external subscriber
+received the sweep, mono16 image, both annotated BGR8 views, LaserScan and
+PointCloud2. A turn counted as complete only when all six start stamps matched
+and both raw payloads matched the SHA-256 of the original sorted FFT rows.
+Latency runs from submission of the wrap packet to receipt of the last product.
+[Stress tool](../tools/stress_playback.py)
+
+| Offered turns/s | Baseline complete out of 48 (`a59f742`) | Tuned separate processes | Tuned composed process |
+| ---: | ---: | ---: | ---: |
+| 4 (native rate) | 48 | 48 | 48 |
+| 8 | 48 | 48 | 48 |
+| 12 | 8 | 15 | 48 |
+| 16 | 3 | 3 | 5 |
+
+At 4 Hz, baseline p95 latency was 111.9 ms and the three nodes used 9.84 s
+of CPU over 48 turns. The composed pipeline measured 68.3 ms and 6.84 s.
+At 16 Hz all three configurations delivered 48 messages on each topic,
+but many raw images had missing rows. These single-host figures include DDS
+and observer scheduling. The CPU figures exclude the feeder and observer.
+
+A longer composed replay at 12 Hz delivered all six products for 192/192
+turns (76,800 spokes). P95 latency was 71.5 ms, maximum latency was 73.4 ms,
+and the container reached 82.6 MiB peak RSS. This segment exposed three
+isolated backward acquisition steps of 81,564, 148,096 and 118,947 ns.
+Before the timestamp fix, those same turns lost their leading rows even
+though the source packet counters and encoders advanced normally. The
+assembler now retains the recorded stamps and marks scan timing irregular.
+
+From the driver checkout with the workspace sourced, run the same checks on
+a private localhost ROS domain. Omit `--composed` to measure separate processes.
+The synthetic inputs have the recorded 400 × 6000 geometry and 4 Hz sensor
+clock. The quiet input stays below the intensity threshold. The dense input
+fills the 48-point cloud budget on every spoke. Both fixtures delivered all six
+products on 48/48 turns at 4 Hz. P95 latency was 77.9 ms for quiet input and
+102.3 ms for dense input.
+
+```bash
+export ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+python3 tools/stress_playback.py /path/to/ros2_mcap --rotations 192 --hz 12 --composed
+python3 tools/stress_playback.py --synthetic quiet --rotations 48 --hz 4 --composed
+python3 tools/stress_playback.py --synthetic dense --rotations 48 --hz 4 --composed
+python3 tools/compare_playback.py /path/to/ros2_mcap --rotations 192 --check-exports
+python3 tools/compare_images.py /path/to/ros2_mcap --rotations 192
+python3 tools/check_tamu_turn.py /path/to/ros2_mcap
+```
+
+The installed composed-launch test feeds four unequal cardinal targets, a
+dense group of equal-strength returns, and an inverted pair of sensor stamps.
+It reads the images with `cv_bridge`, projects the LaserScan with
+`laser_geometry`, and decodes XYZI fields with `sensor_msgs_py`. It checks the
+same physical targets in every product, including the native clockwise bearing
+that appears to the right of the sensor on the plan view.
+[Export regression](../navtech_radar_processing/test/test_composed_exports.py)
+
+On the 192 measured TAMU turns, the independent ROS consumer check matched
+153,883 cloud returns and 61,675 projected scan returns to their source FFT
+intensities and metric bins. Maximum horizontal residuals were 0.0000126 m
+for cloud points on encoder bearings and 0.0000250 m for projected returns
+on the LaserScan angular grid. Both annotated BGR8 views matched the Python
+reference byte-for-byte on all 192 turns. The odometry turn again produced
+a +20.700° scene shift for −20.314° of vehicle yaw. These residuals in metres
+measure conversion arithmetic.
+Physical accuracy also depends on the sensor, timing and mounting calibration.

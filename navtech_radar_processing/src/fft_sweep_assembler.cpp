@@ -4,6 +4,7 @@
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
 #include "planar_products.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_components/register_node_macro.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include <memory>
 #include <optional>
@@ -18,7 +19,8 @@ using Image = sensor_msgs::msg::Image;
 
 class SweepAssembler final : public rclcpp::Node {
 public:
-  SweepAssembler() : Node("navtech_fft_sweep_assembler") {
+  explicit SweepAssembler(const rclcpp::NodeOptions &options)
+      : Node("navtech_fft_sweep_assembler", options) {
     frame_ = param<std::string>("output_frame", "");
     resolution_ = param("range_resolution", 0.0438);
     axis_ = {resolution_, 0};
@@ -163,6 +165,23 @@ private:
                     double(ticks) / config_->encoder_size) < 0.5;
   }
 
+  // The TAMU recording occasionally inverts two adjacent acquisition times
+  // while both the FFT packet counter and encoder continue forward.
+  bool local_stamp_inversion(const Spoke &current, int64_t gap_ns) const {
+    if (pending_.size() < 2 || !config_ || !config_->expected_rotation_rate)
+      return false;
+    const int64_t hz = int64_t(config_->expected_rotation_rate) * count_;
+    const auto &previous = *pending_.back();
+    const auto earlier =
+        nanoseconds(pending_[pending_.size() - 2]->header.stamp);
+    const double cells = double(current.azimuth - previous.azimuth) * count_ /
+                         config_->encoder_size;
+    return -gap_ns <= 999999999LL / hz && earlier > 0 &&
+           nanoseconds(current.header.stamp) > earlier &&
+           uint16_t(current.sweep_counter - previous.sweep_counter) == 1 &&
+           std::abs(cells - 1.0) < 0.5;
+  }
+
   void accept(Spoke::UniquePtr s) {
     if (!valid_frame(s->header.frame_id) || !std::isfinite(s->azimuth_angle) ||
         s->header.stamp.nanosec >= 1000000000u ||
@@ -199,7 +218,7 @@ private:
       const int rate = config_ ? config_->expected_rotation_rate : 0;
       const bool forward_jump = rate ? gap >= (1000000000LL + rate - 1) / rate
                                      : gap * 1e-9 > fallback_gap_;
-      if (gap < 0 || forward_jump) {
+      if ((gap < 0 && !local_stamp_inversion(*s, gap)) || forward_jump) {
         pending_.clear();
         if (deskew_)
           deskew_->clear();
@@ -262,8 +281,8 @@ private:
 
   void publish_raw(const Spoke &first, const builtin_interfaces::msg::Time &end,
                    bool want_sweep, bool want_image) {
-    Sweep sweep;
-    auto &image = sweep.image;
+    auto sweep = std::make_unique<Sweep>();
+    auto &image = sweep->image;
     image.header = first.header;
     image.width = first.data.size();
     image.height = pending_.size();
@@ -281,22 +300,22 @@ private:
         }
       out += image.step;
       if (want_sweep) {
-        sweep.encoder_values.push_back(s->azimuth);
-        sweep.sweep_counters.push_back(s->sweep_counter);
-        sweep.timestamps.push_back(s->header.stamp);
-        sweep.host_stamps.push_back(s->host_stamp);
+        sweep->encoder_values.push_back(s->azimuth);
+        sweep->sweep_counters.push_back(s->sweep_counter);
+        sweep->timestamps.push_back(s->header.stamp);
+        sweep->host_stamps.push_back(s->host_stamp);
       }
     }
     if (want_image)
       images_->publish(image);
     if (want_sweep) {
-      sweep.header = first.header;
-      sweep.end_stamp = end;
-      sweep.configuration_version = first.configuration_version;
-      sweep.sweep_sequence = sequence_;
-      sweep.sample_bit_depth = first.sample_bit_depth;
-      sweep.range_resolution = resolution_;
-      sweeps_->publish(sweep);
+      sweep->header = first.header;
+      sweep->end_stamp = end;
+      sweep->configuration_version = first.configuration_version;
+      sweep->sweep_sequence = sequence_;
+      sweep->sample_bit_depth = first.sample_bit_depth;
+      sweep->range_resolution = resolution_;
+      sweeps_->publish(std::move(sweep));
     }
   }
 
@@ -357,8 +376,4 @@ private:
 };
 } // namespace radar
 
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<radar::SweepAssembler>());
-  rclcpp::shutdown();
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(radar::SweepAssembler)

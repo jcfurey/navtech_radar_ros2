@@ -263,9 +263,9 @@ def test_tf_heading_uses_sweep_stamp_and_does_not_reuse_missing_transform():
         context.try_shutdown()
 
 
-@pytest.mark.parametrize('view', ['polar', 'cartesian'])
-def test_installed_visualizers_partial_padded_sweeps(view):
-    parameters = ['annotate:=false', 'min_range:=0.75', 'max_range:=125.0', 'image_width:=64',
+@pytest.mark.parametrize(('view', 'width'), [('polar', 64), ('cartesian', 64), ('polar', 128)])
+def test_installed_visualizers_partial_padded_sweeps(view, width):
+    parameters = ['annotate:=false', 'min_range:=0.75', 'max_range:=125.0', f'image_width:={width}',
                   'cartesian_size:=151', 'gamma:=0.65', 'azimuth_offset_degrees:=17.0']
     rng = np.random.default_rng(180)
     values = rng.integers(0, 65536, (4, 272), dtype=np.uint16)

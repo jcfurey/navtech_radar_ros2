@@ -22,6 +22,28 @@ double wrap(double x, double period) {
 
 int nearest(double x) { return static_cast<int>(std::nearbyint(x)); }
 
+uint16_t read_level(const uint8_t *p, bool big_endian) {
+  return big_endian ? (p[0] << 8 | p[1]) : (p[1] << 8 | p[0]);
+}
+
+// Fixed-width groups allow the compiler to vectorize adjacent columns.
+// The last column can be shorter, even in a padded or cropped input row.
+template <int fixed_stride = 0>
+void pool_row(const uint8_t *data, int bins, int stride, bool big_endian,
+              uint16_t *pooled) {
+  const int group = fixed_stride ? fixed_stride : stride;
+  const int full = bins / group;
+  for (int col = 0; col < full; ++col) {
+    uint16_t level = pooled[col];
+    for (int j = 0; j < group; ++j)
+      level = std::max(level, read_level(data + 2 * j, big_endian));
+    pooled[col] = level;
+    data += 2 * group;
+  }
+  for (int j = 0; j < bins % group; ++j)
+    pooled[full] = std::max(pooled[full], read_level(data + 2 * j, big_endian));
+}
+
 cv::Mat3b canvas(Image &image, const Sweep &s, int height, int width) {
   image.header = s.header;
   image.encoding = "bgr8";
@@ -278,17 +300,21 @@ void SweepRenderer::render(const Sweep &s, const Config &c,
     const int row = encoder_cell(encoder, rows, c.encoder_size);
     present[row] = true;
     auto *pooled = grid.ptr<uint16_t>(row);
-    const auto *data = image.data.data() + i * image.step;
-    for (int col = 0, bin = first; col < cols; ++col) {
-      uint16_t maximum = pooled[col];
-      const int end = std::min(bin + stride, last);
-      for (; bin < end; ++bin) {
-        const auto *p = data + 2 * bin;
-        const uint16_t level =
-            image.is_bigendian ? (p[0] << 8 | p[1]) : (p[1] << 8 | p[0]);
-        maximum = std::max(maximum, level);
-      }
-      pooled[col] = maximum;
+    const auto *data = image.data.data() + i * image.step + 2 * first;
+    const int bins = last - first;
+    switch (stride) {
+    case 1:
+      pool_row<1>(data, bins, stride, image.is_bigendian, pooled);
+      break;
+    case 2:
+      pool_row<2>(data, bins, stride, image.is_bigendian, pooled);
+      break;
+    case 4:
+      pool_row<4>(data, bins, stride, image.is_bigendian, pooled);
+      break;
+    default:
+      pool_row(data, bins, stride, image.is_bigendian, pooled);
+      break;
     }
   }
   update_colors(grid, present, s, c);

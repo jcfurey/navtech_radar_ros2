@@ -15,6 +15,7 @@
 #include "navtech_radar_msgs/msg/fft_spoke.hpp"
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_components/register_node_macro.hpp"
 
 using Config = navtech_radar_msgs::msg::RadarConfiguration;
 using Spoke = navtech_radar_msgs::msg::FftSpoke;
@@ -25,7 +26,8 @@ using Steady = std::chrono::steady_clock;
 
 class LegacyBagDriver final : public rclcpp::Node {
 public:
-  LegacyBagDriver() : Node("navtech_legacy_bag_driver") {
+  explicit LegacyBagDriver(const rclcpp::NodeOptions &options)
+      : Node("navtech_legacy_bag_driver", options) {
     const auto input_config = param<std::string>(
         "legacy_configuration_topic", "/Navtech/Configuration_Topic");
     const auto input_fft =
@@ -91,8 +93,9 @@ private:
     bins_ = c.range_bins;
     encoder_size_ = c.encoder_size;
     configs_->publish(c);
-    RCLCPP_INFO(get_logger(), "Configuration %u: %u spokes, %u bins, %.6f m/bin",
-                version_, unsigned(c.azimuth_samples), unsigned(c.range_bins),
+    RCLCPP_INFO(get_logger(),
+                "Configuration %u: %u spokes, %u bins, %.6f m/bin", version_,
+                unsigned(c.azimuth_samples), unsigned(c.range_bins),
                 c.range_resolution);
   }
 
@@ -172,8 +175,4 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<LegacyBagDriver>());
-  rclcpp::shutdown();
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(LegacyBagDriver)

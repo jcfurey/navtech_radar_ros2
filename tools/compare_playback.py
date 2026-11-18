@@ -220,6 +220,66 @@ def check_boundary_loss(bag):
           f'Both implementations emitted separate {n_old}- and {n_new}-row sweeps.')
 
 
+def check_recorded_exports(config, groups, results):
+    """Read native ROS exports independently against turns with one recorded spoke per scan cell."""
+    from laser_geometry import LaserProjection
+    from sensor_msgs_py.point_cloud2 import read_points
+
+    projector = LaserProjection()
+    total_cloud = total_scan = 0
+    max_cloud_error = max_scan_error = 0.
+    count, resolution = config.AzimuthSamples, config.range_resolution
+    step = 2 * np.pi / count
+    for rows, (_, scan, cloud) in zip(groups, results):
+        native = np.array([s.azimuth for s in rows]) * (2 * np.pi / config.EncoderSize)
+        positions = (native - native[0]) % (2 * np.pi) / step
+        cells = np.rint(positions).astype(int) % count
+        if (len(rows) != count or len(np.unique(cells)) != count or
+                np.max(np.abs(positions - np.rint(positions))) > 0.25):
+            raise ValueError('Source check needs a complete turn with one spoke per scan cell')
+        order = np.argsort(cells)
+        fft = np.array([rows[i].data for i in order])
+        bearings = -native[order]
+
+        def source_xy(ray, distance, intensity, angle):
+            bins = np.rint(distance / resolution).astype(int)
+            assert np.all((bins >= 0) & (bins < fft.shape[1]))
+            np.testing.assert_array_equal(fft[ray, bins], intensity)
+            radius = bins * resolution
+            np.testing.assert_allclose(distance, radius, rtol=2e-6, atol=2e-5)
+            return np.column_stack((radius * np.cos(angle), radius * np.sin(angle)))
+
+        points = read_points(cloud)
+        xy = np.column_stack((points['x'], points['y'])).astype(float)
+        ray = np.rint((-np.arctan2(xy[:, 1], xy[:, 0]) - native[0]) / step).astype(int) % count
+        expected = source_xy(ray, np.hypot(xy[:, 0], xy[:, 1]), points['intensity'], bearings[ray])
+        np.testing.assert_allclose(xy, expected, rtol=2e-6, atol=2e-5)
+        assert np.all(points['z'] == 0)
+        max_cloud_error = max(max_cloud_error, np.linalg.norm(xy - expected, axis=1).max(initial=0.))
+        total_cloud += len(points)
+
+        ranges = np.asarray(scan.ranges, dtype=float)
+        valid = np.flatnonzero(np.isfinite(ranges))
+        assert np.all((ranges[valid] >= scan.range_min) & (ranges[valid] <= scan.range_max))
+        expected = source_xy(valid, ranges[valid], np.asarray(scan.intensities)[valid],
+                             -native[0] - valid * step)
+        projected = projector.projectLaser(scan)
+        assert projected.header == scan.header
+        points = read_points(projected)
+        # laser_geometry uses an exclusive upper range cutoff.
+        within = ranges[valid] < scan.range_max
+        np.testing.assert_array_equal(points['index'], valid[within])
+        xy = np.column_stack((points['x'], points['y']))
+        np.testing.assert_allclose(xy, expected[within], rtol=2e-6, atol=1e-4)
+        np.testing.assert_array_equal(points['intensity'], np.asarray(scan.intensities)[valid[within]])
+        assert np.all(points['z'] == 0)
+        max_scan_error = max(max_scan_error, np.linalg.norm(xy - expected[within], axis=1).max(initial=0.))
+        total_scan += len(points)
+    print(f'{total_cloud} cloud returns and {total_scan} projected scan returns checked against source FFT. '
+          f'Maximum XY residual: {max_cloud_error:.7f} m on encoder bearings, '
+          f'{max_scan_error:.7f} m on the scan grid.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bag')
@@ -227,8 +287,12 @@ def main():
     mode.add_argument('--rotations', type=int, default=20)
     mode.add_argument('--check-boundary-loss', action='store_true',
                       help='Test loss of a burst across encoder zero on two recorded revolutions')
+    parser.add_argument('--check-exports', action='store_true',
+                        help='Check ROS consumer geometry and raw FFT intensities on complete recorded turns')
     args = parser.parse_args()
     if args.check_boundary_loss:
+        if args.check_exports:
+            parser.error('--check-exports requires complete recorded revolutions')
         check_boundary_loss(args.bag)
         return
     if args.rotations < 1:
@@ -238,6 +302,8 @@ def main():
         reference, py_cpu, py_wall = run_pipeline('python', *inputs)
         native, cpp_cpu, cpp_wall = run_pipeline('cpp', *inputs)
     compare(reference, native)
+    if args.check_exports:
+        check_recorded_exports(inputs[0], inputs[1][1:], native[1:])
     print(f'{args.rotations} measured revolutions; raw sweep and scan parity, cloud XYZ/intensity checked.')
     for label, cpu, wall in [('Python', py_cpu, py_wall), ('C++', cpp_cpu, cpp_wall)]:
         print(f'{label}: assembler {cpu[0]:.2f}s CPU, adapter {cpu[1]:.2f}s CPU, {wall:.2f}s wall')
