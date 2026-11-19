@@ -69,13 +69,41 @@ def test_oxford_bin_centres_and_boreas_sensor_upgrade():
     assert before.offset == after.offset == -0.31
 
 
-def test_colraw_native_depth_and_partial_eof(tmp_path):
+def record(kind, payload, host=2500):
+    signature = bytes.fromhex('0001030307070f0f1f1f3f3f7f7ffefe')
+    packet = signature + struct.pack('>BBI', 1, kind, len(payload)) + payload
+    return struct.pack('<IBII', len(packet), kind, host >> 32, host & 0xffffffff) + packet
+
+
+def write_colraw_boundary_loss(tmp_path, sensor_clock):
+    groups = [range(201), range(500, 800)]
+    config = struct.pack('>6Hff', 400, 438, 1, 5600, 4000, 1600, 1.0, 0.0)
+    path = tmp_path/'loss.colraw'
+    with path.open('wb') as out:
+        out.write(record(10, config))
+        for group in groups:
+            for i in group:
+                ns = 10**9 + i*625000
+                header = struct.pack('>3H', 14, (65300+i) % 65536, i % 400 * 14)
+                stamp = struct.pack('<II', *divmod(ns if sensor_clock else 0, 10**9))
+                out.write(record(31, header + stamp + struct.pack('<H', i), ns // 100))
+    return path, groups
+
+
+@pytest.mark.parametrize('sensor_clock', [False, True])
+def test_colraw_packet_loss_across_encoder_zero(tmp_path, sensor_clock):
     from navtech_recording.formats import colraw_rotations
 
-    def record(kind, payload):
-        signature = bytes.fromhex('0001030307070f0f1f1f3f3f7f7ffefe')
-        packet = signature + struct.pack('>BBI', 1, kind, len(payload)) + payload
-        return struct.pack('<IBII', len(packet), kind, 0, 2500) + packet
+    path, groups = write_colraw_boundary_loss(tmp_path, sensor_clock)
+    rotations = list(colraw_rotations(path))
+    assert [len(r.data) for r in rotations] == [201, 300]
+    for rotation, ticks in zip(rotations, groups):
+        np.testing.assert_array_equal(rotation.data[:, 0], ticks)
+        np.testing.assert_array_equal(rotation.counters, [(65300+i) % 65536 for i in ticks])
+
+
+def test_colraw_native_depth_and_partial_eof(tmp_path):
+    from navtech_recording.formats import colraw_rotations
 
     config = struct.pack('>6Hff', 400, 438, 2, 5600, 4000, 1600, 1.0, 0.0)
     fft = struct.pack('>3H', 14, 65535, 5544) + struct.pack('<II', 0, 0)

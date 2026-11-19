@@ -2,15 +2,23 @@
 """Assemble lossless Navtech FFT spokes into metadata-rich revolutions."""
 
 from array import array
+from collections import deque
 from dataclasses import dataclass
 import math
+import time
 
 from cloud_deskew import CloudDeskew
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'navtech_radar_driver/test/reference'))
+from navtech_recording.boundary import counter_crossed_zero
 from navtech_radar_msgs.msg import FftSpoke, FftSweep, RadarConfiguration
 import numpy as np
 from radar_geometry import encoder_cell, RangeAxis, ros_bearing, scan_cell
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy
@@ -32,6 +40,7 @@ class StoredSpoke:
     host_stamp: object
     frame_id: str
     values: np.ndarray
+    row_time_evidence: bool
 
 
 class FftSweepAssembler(Node):
@@ -65,6 +74,9 @@ class FftSweepAssembler(Node):
             'min_range': 2.0,
             'max_range': 200.0,
             'intensity_threshold': 22000,
+            'recorded_threshold_8bit': 24,
+            'recorded_cfar_offset_8bit': 12.0,
+            'bag_spoke_count': 0,
             'max_points_per_spoke': 48,
             'azimuth_offset_degrees': 0.0,
             'wrap_threshold_degrees': 180.0,
@@ -103,6 +115,9 @@ class FftSweepAssembler(Node):
         self._threshold = int(
             self.get_parameter('intensity_threshold').value
         )
+        self._threshold_8bit = self.get_parameter('recorded_threshold_8bit').value
+        self._offset_8bit = self.get_parameter('recorded_cfar_offset_8bit').value
+        self._bag_spokes = self.get_parameter('bag_spoke_count').value
         self._max_points = int(
             self.get_parameter('max_points_per_spoke').value
         )
@@ -129,17 +144,25 @@ class FftSweepAssembler(Node):
         self._sweep_sequence = 0
         self._dropped_sweeps = 0
         self._invalid_spokes = 0
+        self._received_spokes = self._missing_cells = self._buffer_resets = 0
+        self._time_resets = self._discarded_spokes = self._deskew_skipped = self._previous_losses = 0
+        self._timing = 'unknown'
+        self._bag_queue = deque()
+        self._bag_configs = deque(maxlen=self.get_parameter('input_queue_depth').value)
+        self._last_bag_input = 0.0
+        self._diagnostics = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
+        self._report_timer = self.create_timer(1, self._report, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
         configuration_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=self._bag_configs.maxlen if self._bag_spokes else 1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         spoke_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=int(self.get_parameter('input_queue_depth').value),
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE if self._bag_spokes else ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
         reliable_output_qos = QoSProfile(
@@ -175,7 +198,7 @@ class FftSweepAssembler(Node):
         self._configuration_subscription = self.create_subscription(
             RadarConfiguration,
             str(self.get_parameter('configuration_topic').value),
-            self._configuration_callback,
+            self._receive_config,
             configuration_qos,
         )
         self._spoke_subscription = self.create_subscription(
@@ -186,6 +209,9 @@ class FftSweepAssembler(Node):
         )
 
     def _validate_parameters(self) -> None:
+        if (self._bag_spokes < 0 or not 0 <= self._threshold_8bit <= 255 or
+                not math.isfinite(self._offset_8bit) or self._offset_8bit < 0):
+            raise ValueError('invalid bag spoke count or 8-bit detection settings')
         for name in (
             'range_resolution', 'min_range', 'max_range',
             'azimuth_offset_degrees', 'wrap_threshold_degrees',
@@ -221,6 +247,13 @@ class FftSweepAssembler(Node):
             raise ValueError('input_queue_depth must be positive')
         if self._output_frame.startswith('/'):
             raise ValueError('output_frame must have no leading slash')
+
+    def _receive_config(self, message):
+        if self._bag_spokes:
+            self._bag_configs.append(message)
+            self._drain_bag()
+        else:
+            self._configuration_callback(message)
 
     def _configuration_callback(self, message: RadarConfiguration) -> None:
         axis = RangeAxis.from_config(message)
@@ -276,19 +309,12 @@ class FftSweepAssembler(Node):
         if self._encoder_size is None:
             return False
 
-        steps = (message.sweep_counter - previous.sweep_counter) % 65536
-        if steps == 0 or (message.azimuth >= previous.azimuth and steps < self._expected_spokes):
-            return False
-
-        # How many nominal cells would a forward path crossing zero traverse?
-        ticks = self._encoder_size + message.azimuth - previous.azimuth
-        cells = ticks * self._expected_spokes / self._encoder_size
-        if abs(cells - steps) >= 0.5:
-            return False
-        if (not self._rotation_rate or (previous.stamp.sec, previous.stamp.nanosec) == (0, 0)
+        if ((previous.stamp.sec, previous.stamp.nanosec) == (0, 0)
                 or (message.header.stamp.sec, message.header.stamp.nanosec) == (0, 0)):
-            return True
-        return abs(gap_ns * 1e-9 * self._rotation_rate - ticks / self._encoder_size) < 0.5
+            gap_ns = None
+        return counter_crossed_zero(previous.azimuth, message.azimuth,
+                                    (message.sweep_counter - previous.sweep_counter) % 65536,
+                                    self._expected_spokes, self._encoder_size, self._rotation_rate, gap_ns)
 
     def _local_stamp_inversion(self, message, gap_ns):
         if len(self._spokes) < 2 or not self._rotation_rate:
@@ -303,6 +329,31 @@ class FftSweepAssembler(Node):
                 and abs(cells - 1.0) < 0.5)
 
     def _spoke_callback(self, message: FftSpoke) -> None:
+        self._received_spokes += 1
+        if not self._bag_spokes:
+            self._accept(message)
+            return
+        if len(self._bag_queue) == self._bag_configs.maxlen:
+            self._bag_queue.popleft()
+            self._reject_spoke('Configuration wait queue full')
+        self._bag_queue.append(message)
+        self._last_bag_input = time.monotonic()
+        self._drain_bag()
+
+    def _drain_bag(self, player_gone=False):
+        while self._bag_queue:
+            version = self._bag_queue[0].configuration_version
+            if version and version != self._configuration_version:
+                cfg = next((c for c in reversed(self._bag_configs) if c.configuration_version == version), None)
+                if cfg:
+                    self._configuration_callback(cfg)
+                elif not player_gone:
+                    return
+            self._accept(self._bag_queue.popleft())
+        if player_gone or self._received_spokes == self._bag_spokes:
+            self._finish_sweep()
+
+    def _accept(self, message: FftSpoke) -> None:
         angle = float(message.azimuth_angle)
         if (
             not math.isfinite(angle)
@@ -350,7 +401,12 @@ class FftSweepAssembler(Node):
                       + message.header.stamp.nanosec - previous.stamp.nanosec)
             forward_jump = (gap_ns * self._rotation_rate >= 1_000_000_000 if self._rotation_rate
                             else gap_ns * 1e-9 > self._fallback_gap)
-            if (gap_ns < 0 and not self._local_stamp_inversion(message, gap_ns)) or forward_jump:
+            if (self._bag_spokes and gap_ns and (len(self._spokes) > 1 or forward_jump or gap_ns < 0)
+                    and not previous.row_time_evidence
+                    and all(s.stamp == previous.stamp for s in self._spokes)):
+                self._finish_sweep()
+            elif (gap_ns < 0 and not self._local_stamp_inversion(message, gap_ns)) or forward_jump:
+                self._time_resets += 1
                 self._reset_sweep()
                 if self._deskew:
                     self._deskew.clear()
@@ -363,6 +419,7 @@ class FftSweepAssembler(Node):
                 self._finish_sweep()
 
         if len(self._spokes) >= self._max_buffered_spokes:
+            self._buffer_resets += 1
             self.get_logger().warning(
                 'Sweep buffer limit reached without an azimuth wrap; resetting',
                 throttle_duration_sec=5.0,
@@ -379,6 +436,8 @@ class FftSweepAssembler(Node):
             host_stamp=message.host_stamp,
             frame_id=message.header.frame_id,
             values=values,
+            row_time_evidence=bool(message.ntp_seconds or message.ntp_split_seconds
+                                   or message.host_stamp.sec or message.host_stamp.nanosec),
         ))
 
     def _reject_spoke(self, reason: str) -> None:
@@ -388,19 +447,60 @@ class FftSweepAssembler(Node):
     def _reset_sweep(self) -> None:
         if self._spokes:
             self._dropped_sweeps += 1
+            self._discarded_spokes += len(self._spokes)
         self._spokes = []
+
+    def _report(self):
+        if (self._bag_spokes and (self._bag_queue or self._spokes) and
+                time.monotonic() - self._last_bag_input > 1 and
+                self._spoke_subscription.get_publisher_count() == 0):
+            self._drain_bag(player_gone=True)
+        losses = self._missing_cells + self._invalid_spokes + self._discarded_spokes
+        timing_warning = self._deskew and self._timing not in ('unknown', 'per-spoke')
+        status = DiagnosticStatus(name=self.get_fully_qualified_name() + ': sweep assembly',
+                                  hardware_id=self._configuration_frame or 'navtech')
+        status.level = status.WARN if timing_warning or losses != self._previous_losses else status.OK
+        status.message = ('Deskew requires per-spoke timestamps' if timing_warning else
+                          'Incomplete or rejected radar input' if losses != self._previous_losses else 'Sweep assembly')
+        self._previous_losses = losses
+        counts = {'received_spokes': self._received_spokes, 'rejected_spokes': self._invalid_spokes,
+                  'missing_bearing_cells': self._missing_cells, 'buffer_resets': self._buffer_resets,
+                  'time_resets': self._time_resets, 'discarded_buffered_spokes': self._discarded_spokes,
+                  'sweep_timing': self._timing, 'deskew_skipped_timing': self._deskew_skipped}
+        if self._bag_spokes:
+            counts['bag_spoke_count'] = self._bag_spokes
+        status.values = [KeyValue(key=k, value=str(v)) for k, v in counts.items()]
+        msg = DiagnosticArray(status=[status])
+        msg.header.stamp = self.get_clock().now().to_msg()
+        self._diagnostics.publish(msg)
 
     def _finish_sweep(self) -> None:
         spokes = self._spokes
         self._spokes = []
         if not spokes:
             return
+        if self._encoder_size:
+            cells = {encoder_cell(s.azimuth, self._expected_spokes, self._encoder_size) for s in spokes}
+        else:
+            cells = {int(s.angle * self._expected_spokes / math.tau + 0.5) % self._expected_spokes for s in spokes}
+        self._missing_cells += self._expected_spokes - len(cells)
+        if (self._bag_spokes and any(s.row_time_evidence for s in spokes) and
+                not all(s.row_time_evidence for s in spokes)):
+            self._timing = 'frame timestamp fallback'
+        elif any((s.stamp.sec, s.stamp.nanosec) <= (0, 0) for s in spokes):
+            self._timing = 'missing row timestamps'
+        elif ((len(spokes) > 1 or (self._bag_spokes and not spokes[0].row_time_evidence)) and
+              all(s.stamp == spokes[0].stamp for s in spokes)):
+            self._timing = 'indistinguishable row timestamps'
+        else:
+            self._timing = 'per-spoke'
         if len(spokes) < self._minimum_spokes:
             self._dropped_sweeps += 1
             return
 
-        cells = {encoder_cell(s.azimuth, self._expected_spokes, self._encoder_size)
-                 if self._encoder_size is not None else s.azimuth for s in spokes}
+        # Strict fallback assembly also requires distinct raw encoders.
+        if self._encoder_size is None:
+            cells = {s.azimuth for s in spokes}
         missing_spokes = max(0, self._expected_spokes - len(cells))
         duplicate_spokes = len(spokes) - len(cells)
         if not self._publish_partial:
@@ -446,7 +546,7 @@ class FftSweepAssembler(Node):
         self._image_publisher.publish(image)
         # Extract once for both derived products. Scan selection precedes the
         # cloud's point budget so a strong distant return cannot hide a near one.
-        peaks = ([self._extract_peak_bins(s.values) for s in ordered]
+        peaks = ([self._extract_peak_bins(s.values, s.sample_bit_depth) for s in ordered]
                  if self._publish_scan or self._publish_point_cloud else None)
         point_count = self._publish_cloud(image.header, ordered, peaks)
         if self._publish_scan:
@@ -461,7 +561,7 @@ class FftSweepAssembler(Node):
                 f'{point_count} selected points'
             )
 
-    def _extract_peak_bins(self, values: np.ndarray) -> np.ndarray:
+    def _extract_peak_bins(self, values: np.ndarray, sample_bit_depth=16) -> np.ndarray:
         """Local maxima, optional additive CA-CFAR, then range suppression.
 
         Training/guard counts are per side. Use complete windows only; raw FFT
@@ -478,7 +578,7 @@ class FftSweepAssembler(Node):
 
         center = values[first_bin:last_bin]
         peak_mask = (
-            (center >= self._threshold)
+            (center >= (self._threshold_8bit if sample_bit_depth == 8 else self._threshold))
             & (center > values[first_bin - 1:last_bin - 1])
             & (center >= values[first_bin + 1:last_bin + 1])
         )
@@ -490,7 +590,8 @@ class FftSweepAssembler(Node):
             sums = np.concatenate(([0.0], np.cumsum(values, dtype=np.float64)))
             noise = (sums[bins - guard] - sums[bins - guard - train]
                      + sums[bins + guard + train + 1] - sums[bins + guard + 1]) / (2 * train)
-            bins = bins[values[bins] > noise + self._cfar_offset]
+            offset = self._offset_8bit if sample_bit_depth == 8 else self._cfar_offset
+            bins = bins[values[bins] > noise + offset]
             # Collapse nearby maxima into the strongest reflector. Sorting is
             # stable so equal levels deterministically prefer the nearer bin.
             if bins.size and self._peak_separation > 0:
@@ -530,6 +631,11 @@ class FftSweepAssembler(Node):
 
     def _publish_cloud(self, header, spokes: list[StoredSpoke], peaks=None) -> int:
         if not self._publish_point_cloud:
+            return 0
+        if self._deskew and self._timing != 'per-spoke':
+            self._deskew.clear()
+            self._deskew_skipped += 1
+            self.get_logger().warning(f'Skipping deskewed cloud: {self._timing}', throttle_duration_sec=5.0)
             return 0
 
         # Do projection only for sweeps that pass the publication policy.
@@ -597,7 +703,7 @@ class FftSweepAssembler(Node):
         ranges = np.full(count, np.nan, dtype=np.float32)
         intensities = np.zeros(count, dtype=np.float32)
         observed = np.zeros(count, dtype=bool)
-        timing_valid = bool(self._rotation_rate)
+        timing_valid = bool(self._rotation_rate) and self._timing == 'per-spoke'
         nominal_dt = scan.scan_time / count
         first_ns = first.stamp.sec * 1_000_000_000 + first.stamp.nanosec
         for spoke, bins in zip(spokes, peaks):

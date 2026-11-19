@@ -16,9 +16,9 @@ jobs:
       - name: Install declared dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential python3-colcon-common-extensions python3-rosdep python3-rosbags
+          apt-get install -y --no-install-recommends build-essential python3-colcon-common-extensions python3-rosdep python3-rosbags libarchive-dev
           rosdep update --rosdistro lyrical
-          rosdep install --from-paths src --ignore-src --rosdistro lyrical -y
+          rosdep install --from-paths src --ignore-src --skip-keys "libarchive-dev python3-rosbags-pip" --rosdistro lyrical -y
       - name: Build and test Release executables
         run: |
           source /opt/ros/lyrical/setup.bash

@@ -1,14 +1,15 @@
-"""Compare native and Python executables over DDS, including partial rotations."""
+"""Compare the native pipeline and its test oracle over DDS, including partial rotations."""
 from array import array
 from contextlib import ExitStack
-import math
 from pathlib import Path
+import math
 import subprocess
 import time
 from uuid import uuid4
 
 from ament_index_python.packages import get_package_prefix
-from compare_playback import check_filtered_cloud, compare, run_pipeline, stop
+from compare_playback import check_filtered_cloud, comparison_command, compare, run_pipeline, stop
+from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
 from nav_ross.msg import HighPrecisionFFTData, nav_msg
@@ -20,7 +21,22 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan, PointCloud2
 
 
-@pytest.mark.parametrize(('mode', 'selection'), [('cfar', 'nearest'), ('threshold', 'strongest')])
+def test_installed_datapath_is_native():
+    packages = {
+        'navtech_radar_driver': {'legacy_bag_driver', 'recording_player', 'bag_player', 'road_cloud_adapter'},
+        'navtech_radar_processing': {'fft_sweep_assembler', 'fft_sweep_visualizer'},
+    }
+    for package, required in packages.items():
+        folder = Path(get_package_prefix(package)) / 'lib' / package
+        binaries = [program for program in folder.iterdir() if program.is_file()]
+        assert required <= {program.name for program in binaries}
+        for program in binaries:
+            with program.open('rb') as src:
+                assert src.read(4) == b'\x7fELF', program
+
+
+@pytest.mark.parametrize('mode', ['cfar', 'threshold'])
+@pytest.mark.parametrize('selection', ['nearest', 'strongest'])
 def test_installed_pipelines(mode, selection):
     cfg = nav_msg(range_resolution=0.125, AzimuthSamples=4, EncoderSize=360,
                   BinSize=1250, RangeInBins=96, ExpectedRotationRate=4)
@@ -94,8 +110,8 @@ def test_canonical_calibration_over_dds(suffix):
             node.create_subscription(msg, 'navtech_radar/' + topic,
                                      lambda value, key=topic: collect(key, value), qos)
         package = 'navtech_radar_processing'
-        binary = Path(get_package_prefix(package)) / 'lib' / package / ('fft_sweep_assembler' + suffix)
-        cmd = [str(binary), '--ros-args', '-r', '__ns:=' + ns]
+        binary = comparison_command(package, 'fft_sweep_assembler', bool(suffix))
+        cmd = [*binary, '--ros-args', '-r', '__ns:=' + ns]
         for param in ['publish_scan:=true', 'publish_point_cloud:=true', 'min_range:=0.0',
                       'max_range:=5.0', 'intensity_threshold:=100', 'peak_selection:=threshold']:
             cmd.extend(['-p', param])
@@ -143,15 +159,20 @@ def test_strict_sweeps_and_motion_compensation(suffix):
         pub = node.create_publisher(FftSpoke, 'navtech_radar/fft/spoke', 64)
         tf = TransformBroadcaster(node)
         received = {'fft/sweep': {}, 'point_cloud': {}, 'scan': {}}
+        reports = []
+        node.create_subscription(DiagnosticArray, 'diagnostics',
+                                 lambda m: reports.extend({v.key: v.value for v in s.values}
+                                                          for s in m.status), 10)
         for topic, msg, qos in [('fft/sweep', FftSweep, 8), ('point_cloud', PointCloud2, qos_profile_sensor_data),
                                 ('scan', LaserScan, qos_profile_sensor_data)]:
             node.create_subscription(msg, 'navtech_radar/' + topic,
                                      lambda m, key=topic: received[key].update({m.header.stamp.sec: m}), qos)
         package = 'navtech_radar_processing'
-        exe = Path(get_package_prefix(package)) / 'lib' / package / ('fft_sweep_assembler' + suffix)
-        cmd = [str(exe), '--ros-args', '-r', '__ns:=' + ns]
+        exe = comparison_command(package, 'fft_sweep_assembler', bool(suffix))
+        cmd = [*exe, '--ros-args', '-r', '__ns:=' + ns]
         for option in ['publish_scan:=true', 'publish_point_cloud:=true', 'publish_partial_sweeps:=false',
-                       'deskew_fixed_frame:=' + fixed, 'min_range:=0.0']:
+                       'deskew_fixed_frame:=' + fixed, 'min_range:=0.0',
+                       'expected_spokes:=4', 'max_buffered_spokes:=4']:
             cmd += ['-p', option]
         child = subprocess.Popen(cmd)
         cleanup.callback(stop, child)
@@ -213,6 +234,10 @@ def test_strict_sweeps_and_motion_compensation(suffix):
                                     np.arange(4), np.full(4, 30000)))
         points = np.frombuffer(cloud.data, dtype='<f4').reshape(-1, 4)
         np.testing.assert_allclose(points, expected, atol=1e-5)
+        send(11, azimuths=[90]*5)
+        wait(lambda: reports and int(reports[-1]['buffer_resets']) > 0)
+        for key in ('missing_bearing_cells', 'rejected_spokes', 'time_resets', 'discarded_buffered_spokes'):
+            assert int(reports[-1][key]) > 0
 
 
 def test_packet_loss_across_encoder_zero():

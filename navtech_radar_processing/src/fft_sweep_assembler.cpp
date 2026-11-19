@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "cloud_deskew.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "navtech_radar_msgs/msg/fft_sweep.hpp"
 #include "navtech_radar_msgs/msg/radar_configuration.hpp"
 #include "navtech_radar_msgs/msg/recorded_rotation.hpp"
@@ -7,7 +8,9 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/register_node_macro.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include <deque>
 #include <memory>
+#include <omp.h>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -18,6 +21,7 @@ using Config = navtech_radar_msgs::msg::RadarConfiguration;
 using Recording = navtech_radar_msgs::msg::RecordedRotation;
 using Sweep = navtech_radar_msgs::msg::FftSweep;
 using Image = sensor_msgs::msg::Image;
+using Diagnostics = diagnostic_msgs::msg::DiagnosticArray;
 
 class SweepAssembler final : public rclcpp::Node {
 public:
@@ -48,7 +52,10 @@ public:
                  param("max_points_per_spoke", 48),
                  mode == "cfar",
                  selection == "nearest"};
-    const auto depth = param("input_queue_depth", 512);
+    const auto depth = param("input_queue_depth", 1024);
+    bag_spokes_ = param<int64_t>("bag_spoke_count", 0);
+    if (bag_spokes_ < 0)
+      throw std::invalid_argument("negative bag_spoke_count");
     const auto &p = settings_;
     if (mode != "cfar" && mode != "threshold")
       throw std::invalid_argument("invalid peak_selection");
@@ -88,15 +95,22 @@ public:
     scans_ = create_publisher<Scan>(
         param<std::string>("scan_topic", "navtech_radar/scan"),
         rclcpp::SensorDataQoS());
+    const int threads =
+        param("detection_threads", std::min(8, omp_get_max_threads()));
+    if (threads < 1 || threads > 32)
+      throw std::invalid_argument("detection_threads must be between 1 and 32");
+    detectors_.resize(threads);
+    settings_8bit_ = settings_;
+    settings_8bit_.threshold = param("recorded_threshold_8bit", 24);
+    settings_8bit_.cfar_offset = param("recorded_cfar_offset_8bit", 12.0);
+    if (settings_8bit_.threshold < 0 || settings_8bit_.threshold > 255 ||
+        !std::isfinite(settings_8bit_.cfar_offset) ||
+        settings_8bit_.cfar_offset < 0)
+      throw std::invalid_argument("invalid 8-bit detector settings");
+    diagnostics_ = create_publisher<Diagnostics>("diagnostics", 10);
+    report_timer_ =
+        create_wall_timer(std::chrono::seconds(1), [this] { report(); });
     if (param("recorded_input", false)) {
-      recorded_settings_ = settings_;
-      recorded_settings_.threshold = param("recorded_threshold_8bit", 24);
-      recorded_settings_.cfar_offset = param("recorded_cfar_offset_8bit", 12.0);
-      if (recorded_settings_.threshold < 0 ||
-          recorded_settings_.threshold > 255 ||
-          !std::isfinite(recorded_settings_.cfar_offset) ||
-          recorded_settings_.cfar_offset < 0)
-        throw std::invalid_argument("invalid 8-bit detector settings");
       config_output_ = create_publisher<Config>(
           "navtech_radar/configuration", rclcpp::QoS(1).transient_local());
       spoke_output_ = create_publisher<Spoke>("navtech_radar/fft/spoke",
@@ -106,15 +120,40 @@ public:
           [this](Recording::ConstSharedPtr rotation) { replay(*rotation); });
       return;
     }
+    bag_queue_limit_ = depth;
     configs_ = create_subscription<Config>(
         param<std::string>("configuration_topic",
                            "navtech_radar/configuration"),
-        rclcpp::QoS(1).transient_local(),
-        [this](Config::ConstSharedPtr c) { configure(std::move(c)); });
+        rclcpp::QoS(bag_spokes_ ? depth : 1).transient_local(),
+        [this](Config::ConstSharedPtr c) {
+          if (!bag_spokes_) {
+            configure(std::move(c));
+            return;
+          }
+          if (bag_configs_.size() == bag_queue_limit_)
+            bag_configs_.pop_front();
+          bag_configs_.push_back(std::move(c));
+          drain_bag();
+        });
+    auto qos = rclcpp::QoS(depth);
+    if (!bag_spokes_)
+      qos.best_effort();
     spokes_ = create_subscription<Spoke>(
-        param<std::string>("spoke_topic", "navtech_radar/fft/spoke"),
-        rclcpp::QoS(depth).best_effort(),
-        [this](Spoke::UniquePtr s) { accept(std::move(s)); });
+        param<std::string>("spoke_topic", "navtech_radar/fft/spoke"), qos,
+        [this](Spoke::UniquePtr s) {
+          ++received_spokes_;
+          if (!bag_spokes_) {
+            accept(std::move(s));
+            return;
+          }
+          if (bag_queue_.size() == bag_queue_limit_) {
+            ++rejected_spokes_;
+            bag_queue_.pop_front();
+          }
+          bag_queue_.push_back(std::move(s));
+          last_bag_input_ = std::chrono::steady_clock::now();
+          drain_bag();
+        });
   }
 
 private:
@@ -126,6 +165,30 @@ private:
 
   bool valid_frame(const std::string &id) const {
     return !id.empty() && id.front() != '/' && (frame_.empty() || frame_ == id);
+  }
+
+  // DDS preserves order within each topic. A configuration can arrive either
+  // side of its first spoke. Apply it in spoke order, including at EOF.
+  void drain_bag(bool player_gone = false) {
+    while (!bag_queue_.empty()) {
+      const auto version = bag_queue_.front()->configuration_version;
+      if (version && (!config_ || config_->configuration_version != version)) {
+        const auto cfg =
+            std::find_if(bag_configs_.rbegin(), bag_configs_.rend(),
+                         [version](const auto &c) {
+                           return c->configuration_version == version;
+                         });
+        if (cfg != bag_configs_.rend())
+          configure(*cfg);
+        else if (!player_gone)
+          return;
+      }
+      auto s = std::move(bag_queue_.front());
+      bag_queue_.pop_front();
+      accept(std::move(s));
+    }
+    if (player_gone || received_spokes_ == static_cast<uint64_t>(bag_spokes_))
+      finish();
   }
 
   void configure(Config::ConstSharedPtr c) {
@@ -195,14 +258,18 @@ private:
     }
     configure(std::make_shared<Config>(cfg));
     const bool send_spokes = spoke_output_->get_subscription_count() > 0;
+    bool used_frame_stamp = false;
     for (size_t i = 0; i < n; ++i) {
       if (!r.row_flags.empty() && r.source_format != "boreas_rt" &&
-          !r.row_flags[i])
+          !r.row_flags[i]) {
+        ++rejected_spokes_;
         continue;
+      }
       auto s = std::make_unique<Spoke>();
       s->header = img.header;
       const uint64_t sensor = r.sensor_ns.empty() ? 0 : r.sensor_ns[i];
       const uint64_t receipt = r.receipt_ns.empty() ? 0 : r.receipt_ns[i];
+      used_frame_stamp |= !sensor && !receipt;
       if (receipt)
         s->host_stamp = rclcpp::Time(static_cast<int64_t>(receipt));
       if (sensor || receipt)
@@ -220,15 +287,19 @@ private:
         s->data.assign(row, row + img.width);
       else {
         s->data.resize(img.width);
-        for (size_t j = 0; j < img.width; ++j)
-          s->data[j] = img.is_bigendian ? row[2 * j] * 256 + row[2 * j + 1]
-                                        : row[2 * j + 1] * 256 + row[2 * j];
+        if (bool(img.is_bigendian) == big_endian())
+          std::memcpy(s->data.data(), row, img.step);
+        else
+          for (size_t j = 0; j < img.width; ++j)
+            s->data[j] = img.is_bigendian ? row[2 * j] * 256 + row[2 * j + 1]
+                                          : row[2 * j + 1] * 256 + row[2 * j];
       }
       if (send_spokes)
         spoke_output_->publish(*s);
       pending_.push_back(std::move(s));
     }
-    finish();
+    received_spokes_ += n;
+    finish(used_frame_stamp);
   }
 
   bool crossed_zero(const Spoke &previous, const Spoke &current,
@@ -290,6 +361,7 @@ private:
                      s->azimuth >= config_->encoder_size)) ||
         (s->sample_bit_depth == 8 &&
          *std::max_element(s->data.begin(), s->data.end()) > 255)) {
+      ++rejected_spokes_;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "Ignoring incompatible FFT spoke");
       return;
@@ -299,6 +371,7 @@ private:
       const double encoder_angle = tau * s->azimuth / config_->encoder_size;
       if (std::abs(std::remainder(s->azimuth_angle - encoder_angle, tau)) >
           tau / (2 * config_->encoder_size) + 1e-12) {
+        ++rejected_spokes_;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                              "FFT spoke angle disagrees with encoder count");
         return;
@@ -312,7 +385,19 @@ private:
       const int rate = config_ ? config_->expected_rotation_rate : 0;
       const bool forward_jump = rate ? gap >= (1000000000LL + rate - 1) / rate
                                      : gap * 1e-9 > fallback_gap_;
-      if ((gap < 0 && !local_stamp_inversion(*s, gap)) || forward_jump) {
+      // Frame-timed PNG recordings carry the same acquisition stamp on each
+      // row. A change of frame stamp can span a full turn or a dataset gap.
+      if (bag_spokes_ && gap &&
+          (pending_.size() > 1 || forward_jump || gap < 0) &&
+          !prev.ntp_seconds && !prev.ntp_split_seconds &&
+          !nanoseconds(prev.host_stamp) &&
+          nanoseconds(pending_.front()->header.stamp) ==
+              nanoseconds(prev.header.stamp) &&
+          same_stamps()) {
+        finish();
+      } else if ((gap < 0 && !local_stamp_inversion(*s, gap)) || forward_jump) {
+        discarded_spokes_ += pending_.size();
+        ++time_resets_;
         pending_.clear();
         if (deskew_)
           deskew_->clear();
@@ -323,6 +408,8 @@ private:
         finish();
     }
     if (pending_.size() >= static_cast<size_t>(max_rows_)) {
+      discarded_spokes_ += pending_.size();
+      ++buffer_resets_;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "Sweep buffer limit reached");
       pending_.clear();
@@ -346,7 +433,84 @@ private:
     return true;
   }
 
-  void finish() {
+  bool same_stamps() const {
+    const auto stamp = pending_.front()->header.stamp;
+    return std::all_of(pending_.begin(), pending_.end(),
+                       [&](const auto &s) { return s->header.stamp == stamp; });
+  }
+
+  void report() {
+    if (bag_spokes_ && (!bag_queue_.empty() || !pending_.empty()) &&
+        std::chrono::steady_clock::now() - last_bag_input_ >
+            std::chrono::seconds(1) &&
+        spokes_->get_publisher_count() == 0)
+      drain_bag(true);
+    Diagnostics msg;
+    msg.header.stamp = now();
+    auto &s = msg.status.emplace_back();
+    s.name = std::string(get_fully_qualified_name()) + ": sweep assembly";
+    s.hardware_id = config_ ? config_->header.frame_id : "navtech";
+    const auto losses = missing_cells_ + rejected_spokes_ + discarded_spokes_;
+    const bool timing_warning =
+        deskew_ && timing_ != "per-spoke" && timing_ != "unknown";
+    s.level = timing_warning || losses != previous_losses_ ? s.WARN : s.OK;
+    s.message = timing_warning ? "Deskew requires per-spoke timestamps"
+                : losses != previous_losses_
+                    ? "Incomplete or rejected radar input"
+                    : "Sweep assembly";
+    previous_losses_ = losses;
+    auto add = [&](const char *key, const std::string &value) {
+      auto &kv = s.values.emplace_back();
+      kv.key = key;
+      kv.value = value;
+    };
+    add("received_spokes", std::to_string(received_spokes_));
+    if (bag_spokes_)
+      add("bag_spoke_count", std::to_string(bag_spokes_));
+    add("rejected_spokes", std::to_string(rejected_spokes_));
+    add("missing_bearing_cells", std::to_string(missing_cells_));
+    add("buffer_resets", std::to_string(buffer_resets_));
+    add("time_resets", std::to_string(time_resets_));
+    add("discarded_buffered_spokes", std::to_string(discarded_spokes_));
+    add("sweep_timing", timing_);
+    add("deskew_skipped_timing", std::to_string(deskew_skipped_));
+    diagnostics_->publish(msg);
+  }
+
+  void finish(bool used_frame_stamp = false) {
+    if (pending_.empty())
+      return;
+    std::vector<bool> seen(count_);
+    for (const auto &s : pending_) {
+      const int cell =
+          config_ ? encoder_cell(s->azimuth, count_, config_->encoder_size)
+                  : int(std::llround(s->azimuth_angle * count_ / tau)) % count_;
+      seen[cell] = true;
+    }
+    missing_cells_ += std::count(seen.begin(), seen.end(), false);
+    // Our file publisher leaves both exact-time fields unset on a row that
+    // fell back to the frame time. Old independent publishers may leave all
+    // auxiliary fields unset even when their header times are distinct.
+    const auto has_row_time = [](const auto &s) {
+      return s->ntp_seconds || s->ntp_split_seconds ||
+             nanoseconds(s->host_stamp);
+    };
+    const bool mixed =
+        bag_spokes_ &&
+        !std::all_of(pending_.begin(), pending_.end(), has_row_time) &&
+        std::any_of(pending_.begin(), pending_.end(), has_row_time);
+    if (used_frame_stamp || mixed)
+      timing_ = "frame timestamp fallback";
+    else if (std::any_of(pending_.begin(), pending_.end(), [](const auto &s) {
+               return nanoseconds(s->header.stamp) <= 0;
+             }))
+      timing_ = "missing row timestamps";
+    else if (same_stamps() &&
+             (pending_.size() > 1 ||
+              (bag_spokes_ && !has_row_time(pending_.front()))))
+      timing_ = "indistinguishable row timestamps";
+    else
+      timing_ = "per-spoke";
     if (pending_.size() < static_cast<size_t>(minimum_)) {
       pending_.clear();
       return;
@@ -420,23 +584,43 @@ private:
       scan.emplace(first, count_, axis_,
                    config_ ? config_->expected_rotation_rate : 0, offset_,
                    settings_);
-    if (publish_cloud_ && clouds_->get_subscription_count())
-      cloud = empty_cloud(first.header);
+    if (publish_cloud_ && clouds_->get_subscription_count()) {
+      if (deskew_ && timing_ != "per-spoke") {
+        deskew_->clear();
+        ++deskew_skipped_;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Skipping deskewed cloud: %s", timing_.c_str());
+      } else
+        cloud = empty_cloud(first.header);
+    }
     if (!scan && !cloud)
       return;
     std::vector<SpokePoints> spans;
-    for (const auto &s : pending_) {
-      const auto &bins = detector_.select(
-          s->data, axis_,
-          recordings_ && s->sample_bit_depth == 8 ? recorded_settings_
-                                                  : settings_);
-      if (scan)
-        scan->add(*s, bins, axis_, settings_.nearest);
-      if (cloud && !bins.empty()) {
-        append_points(*cloud, *s, bins, axis_, offset_, settings_.cloud_limit,
-                      cloud_bins_);
-        if (deskew_)
-          spans.push_back({s->header.stamp, cloud->width});
+    // A detector owns its CFAR scratch. Work across independent rows, then
+    // apply duplicate-ray selection and append points in original encoder
+    // order. Bound temporary bin lists even for large, dense rotations.
+    constexpr size_t batch = 128;
+    for (size_t start = 0; start < pending_.size(); start += batch) {
+      int rows = std::min(batch, pending_.size() - start);
+      selected_.resize(rows);
+#pragma omp parallel for schedule(static)                                      \
+    num_threads(detectors_.size()) if (rows >= 32 && detectors_.size() > 1)
+      for (int i = 0; i < rows; ++i) {
+        const auto &s = *pending_[start + i];
+        detectors_[omp_get_thread_num()].select(
+            s.data, axis_, s.sample_bit_depth == 8 ? settings_8bit_ : settings_,
+            scan.has_value(), cloud.has_value(), selected_[i]);
+      }
+      for (int i = 0; i < rows; ++i) {
+        const auto &s = pending_[start + i];
+        const auto &detection = selected_[i];
+        if (scan)
+          scan->add(*s, detection.scan_bin, axis_, settings_.nearest);
+        if (cloud && !detection.cloud_bins.empty()) {
+          append_points(*cloud, *s, detection.cloud_bins, axis_, offset_);
+          if (deskew_)
+            spans.push_back({s->header.stamp, cloud->width});
+        }
       }
     }
     if (cloud) {
@@ -446,7 +630,7 @@ private:
         clouds_->publish(*cloud);
     }
     if (scan) {
-      const auto &msg = scan->finish();
+      const auto &msg = scan->finish(timing_ == "per-spoke");
       if (msg.range_max >= msg.range_min)
         scans_->publish(msg);
     }
@@ -457,14 +641,25 @@ private:
   int count_, minimum_, max_rows_, max_bins_;
   bool partial_, publish_cloud_, publish_scan_;
   uint32_t sequence_{};
-  DetectionSettings settings_, recorded_settings_;
+  DetectionSettings settings_, settings_8bit_;
+  int64_t bag_spokes_{};
+  size_t bag_queue_limit_{};
+  std::deque<Config::ConstSharedPtr> bag_configs_;
+  std::deque<Spoke::UniquePtr> bag_queue_;
+  std::chrono::steady_clock::time_point last_bag_input_{};
+  uint64_t received_spokes_{}, rejected_spokes_{}, missing_cells_{},
+      buffer_resets_{}, time_resets_{}, discarded_spokes_{}, deskew_skipped_{},
+      previous_losses_{};
+  std::string timing_{"unknown"};
+  rclcpp::Publisher<Diagnostics>::SharedPtr diagnostics_;
+  rclcpp::TimerBase::SharedPtr report_timer_;
   rclcpp::Publisher<Config>::SharedPtr config_output_;
   rclcpp::Publisher<Spoke>::SharedPtr spoke_output_;
   rclcpp::Subscription<Recording>::SharedPtr recordings_;
   RangeAxis axis_;
   std::unique_ptr<CloudDeskew> deskew_;
-  PeakDetector detector_;
-  std::vector<int> cloud_bins_;
+  std::vector<PeakDetector> detectors_;
+  std::vector<RowDetections> selected_;
   Config::ConstSharedPtr config_;
   std::vector<Spoke::UniquePtr> pending_;
   rclcpp::Publisher<Sweep>::SharedPtr sweeps_;

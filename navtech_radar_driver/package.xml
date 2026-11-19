@@ -7,15 +7,22 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-opencv</exec_depend>
-  <exec_depend>python3-rosbags-pip</exec_depend>
-  <exec_depend>builtin_interfaces</exec_depend>
-  <exec_depend>rosgraph_msgs</exec_depend>
-  <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend>rosidl_runtime_py</exec_depend>
+  <test_depend>python3-numpy</test_depend>
+  <test_depend>python3-opencv</test_depend>
+  <test_depend>python3-rosbags-pip</test_depend>
+  <depend>builtin_interfaces</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <test_depend>rosidl_runtime_py</test_depend>
   <exec_depend>unzip</exec_depend>
+  <depend>rosbag2_transport</depend>
+  <depend>libopencv-dev</depend>
+  <depend>libarchive-dev</depend>
+  <depend>libzip-dev</depend>
+  <depend>bzip2</depend>
+  <depend>liblz4-dev</depend>
+  <depend>zlib</depend>
+  <depend>nlohmann-json-dev</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
 
@@ -23,7 +30,8 @@
   <depend>nav_ross</depend>
   <depend>navtech_radar_msgs</depend>
   <depend>rcl_interfaces</depend>
-  <exec_depend>rclpy</exec_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>rclpy</test_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_cmake_ros</test_depend>

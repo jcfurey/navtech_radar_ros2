@@ -87,6 +87,18 @@ def pixels(sweep):
     )
 
 
+def test_bag_versions_can_arrive_after_their_spokes(make_node):
+    node = make_node(bag_spoke_count=3, minimum_spokes=1)
+    for azimuth, version in [(0, 1), (90, 1), (180, 2)]:
+        node._spoke_callback(spoke(azimuth, version=version))
+    node._receive_config(configuration(version=2, resolution=0.25))
+    assert not node._sweep_publisher.messages
+    node._receive_config(configuration(version=1, resolution=0.5))
+    assert [(s.configuration_version, s.range_resolution, list(s.encoder_values))
+            for s in node._sweep_publisher.messages] == [(1, 0.5, [0, 90]), (2, 0.25, [180])]
+    assert not node._invalid_spokes
+
+
 def test_wrap_preserves_uint16_and_aligned_metadata(make_node):
     node = make_node(expected_spokes=3)
     sources = [spoke(10, stamp=10), spoke(180, stamp=11), spoke(350, stamp=12)]

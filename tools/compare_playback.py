@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 from uuid import uuid4
 
@@ -63,10 +64,16 @@ def cpu_seconds(process):
     return (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
 
 
+def comparison_command(package, name, reference=False):
+    """Python comparison oracles live only in the source checkout."""
+    if reference:
+        return [sys.executable, str(Path(__file__).resolve().parents[1] / package / 'test/reference' / (name + '.py'))]
+    return [str(Path(get_package_prefix(package)) / 'lib' / package / name)]
+
+
 def run_pipeline(implementation, config, groups, sentinel, selection='nearest', mode='cfar',
                  assembler_options=()):
     """Feed bounded bursts and wait for all four products at every revolution."""
-    suffix = '_py' if implementation == 'python' else ''
     namespace = f'/navtech_check_{uuid4().hex}'
     node = rclpy.create_node('playback_compare', namespace=namespace)
     # Mark discovery traffic with a time beyond the first acquisition. The
@@ -107,8 +114,8 @@ def run_pipeline(implementation, config, groups, sentinel, selection='nearest', 
                     'peak_selection:=' + mode, 'scan_selection:=' + selection, *assembler_options]),
                 ('navtech_radar_driver', 'legacy_bag_driver', [
                     'legacy_configuration_topic:=legacy_config', 'legacy_fft_topic:=legacy_fft'])]:
-            binary = Path(get_package_prefix(package)) / 'lib' / package / (exe + suffix)
-            args = [str(binary), '--ros-args', '-r', '__ns:=' + namespace, '-p', 'use_sim_time:=true']
+            binary = comparison_command(package, exe, implementation == 'python')
+            args = [*binary, '--ros-args', '-r', '__ns:=' + namespace, '-p', 'use_sim_time:=true']
             for param in params:
                 args.extend(['-p', param])
             process = subprocess.Popen(args)

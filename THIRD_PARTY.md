@@ -28,7 +28,7 @@ converted MCAP. The authors' [Navtech high-resolution ROS repository](https://gi
 is the reference for the original topic and encoder conventions. The checkout
 includes the interfaces and example images. Obtain recordings from the dataset authors.
 
-The public-recording readers use acquisition and calibration conventions published by Oxford Robotics Institute, Heriot-Watt University, University of Toronto ASRL, KAIST and ETH Zürich. Navtech supplies the original Colossus examples and the Windows decoder used for the Thames companion. Each dataset retains its publisher's terms. The ROS 1 road bag reader uses Ternaris' Rosbags library for ROS 1 to ROS 2 serialization. [Dataset sources](docs/radar-products-and-recordings.md) · [Reader and calibration references](docs/recording-playback.md) · [Rosbags](https://ternaris.gitlab.io/rosbags/)
+The public-recording readers use acquisition and calibration conventions published by Oxford Robotics Institute, Heriot-Watt University, University of Toronto ASRL, KAIST and ETH Zürich. Navtech supplies the original Colossus examples and the Windows decoder used for the Thames companion. Each dataset retains its publisher's terms. The native road reader follows the ROS 1 indexed bag format. Regression tests use Ternaris’ Rosbags as an independent serialization reference. [ROS bag storage implementation](https://github.com/ros/ros_comm/blob/noetic-devel/tools/rosbag_storage/src/bag.cpp) [Dataset sources](docs/radar-products-and-recordings.md) · [Reader and calibration references](docs/recording-playback.md) · [Rosbags](https://ternaris.gitlab.io/rosbags/)
 
 ## Related implementations
 

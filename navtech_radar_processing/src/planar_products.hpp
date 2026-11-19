@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -48,12 +49,19 @@ struct DetectionSettings {
   bool cfar, nearest;
 };
 
+struct RowDetections {
+  int scan_bin = -1;
+  std::vector<int> cloud_bins;
+};
+
 // Reuse scratch space across spokes.
 class PeakDetector {
 public:
-  const std::vector<int> &select(const std::vector<uint16_t> &samples,
-                                 const RangeAxis &axis,
-                                 const DetectionSettings &p) {
+  void select(const std::vector<uint16_t> &samples, const RangeAxis &axis,
+              const DetectionSettings &p, bool want_scan, bool want_cloud,
+              RowDetections &out) {
+    out.scan_bin = -1;
+    out.cloud_bins.clear();
     const int width = static_cast<int>(samples.size());
     const int margin = p.cfar ? p.training + p.guard : 1;
     const auto [start, stop] = axis.window(width, p.min_range, p.max_range);
@@ -61,7 +69,7 @@ public:
     const int end = std::min(width - margin, stop);
     bins_.clear();
     if (first >= end)
-      return bins_;
+      return;
     const auto *data = samples.data();
     constexpr int block_size = 32;
     for (int begin = first; begin < end; begin += block_size) {
@@ -100,30 +108,68 @@ public:
     const int separation = static_cast<int>(
         std::ceil(std::min(double(width), p.separation / axis.spacing)));
     if (p.cfar && separation > 1 && bins_.size() > 1) {
-      // Sorting integer keys keeps equal-strength peaks in ascending bin order.
+      // Rank by decreasing intensity and then increasing range bin.
       // Both the FFT level and a bin index fit in 16 bits on the wire.
       priority_.clear();
       for (int i : bins_)
         priority_.push_back((uint32_t(UINT16_MAX - samples[i]) << 16) |
                             uint32_t(i));
-      std::sort(priority_.begin(), priority_.end());
-      enum : uint8_t { available, suppressed, retained };
-      blocked_.assign(width, available);
-      for (uint32_t key : priority_) {
-        const int i = key & UINT16_MAX;
+      const auto strongest_first = std::greater<uint32_t>{};
+      std::make_heap(priority_.begin(), priority_.end(), strongest_first);
+      blocked_.assign(width, false);
+      const size_t cloud_budget =
+          want_cloud ? (p.cloud_limit ? static_cast<size_t>(p.cloud_limit)
+                                      : bins_.size())
+                     : 0;
+      size_t first_candidate = 0;
+      while (!priority_.empty()) {
+        const int i = priority_.front() & UINT16_MAX;
+        std::pop_heap(priority_.begin(), priority_.end(), strongest_first);
+        priority_.pop_back();
         if (blocked_[i])
           continue;
         std::fill(blocked_.begin() + std::max(0, i - separation + 1),
-                  blocked_.begin() + std::min(width, i + separation),
-                  suppressed);
-        blocked_[i] = retained;
+                  blocked_.begin() + std::min(width, i + separation), true);
+        if (out.cloud_bins.size() < cloud_budget)
+          out.cloud_bins.push_back(i);
+        if (want_scan && (out.scan_bin < 0 || (p.nearest && i < out.scan_bin)))
+          out.scan_bin = i;
+        // Once every closer candidate has been suppressed or retained, weaker
+        // peaks cannot change the nearest return. The strongest is known first.
+        if (out.cloud_bins.size() < cloud_budget)
+          continue;
+        if (want_scan && p.nearest) {
+          while (first_candidate < bins_.size() &&
+                 bins_[first_candidate] < out.scan_bin &&
+                 blocked_[bins_[first_candidate]])
+            ++first_candidate;
+          if (first_candidate < bins_.size() &&
+              bins_[first_candidate] < out.scan_bin)
+            continue;
+        }
+        break;
       }
-      bins_.erase(
-          std::remove_if(bins_.begin(), bins_.end(),
-                         [&](int i) { return blocked_[i] != retained; }),
-          bins_.end());
+      std::sort(out.cloud_bins.begin(), out.cloud_bins.end());
+      return;
     }
-    return bins_;
+    if (bins_.empty())
+      return;
+    auto stronger = [&](int a, int b) {
+      return samples[a] == samples[b] ? a < b : samples[a] > samples[b];
+    };
+    if (want_scan)
+      out.scan_bin =
+          p.nearest ? bins_.front()
+                    : *std::min_element(bins_.begin(), bins_.end(), stronger);
+    if (want_cloud) {
+      if (p.cloud_limit && bins_.size() > size_t(p.cloud_limit)) {
+        std::nth_element(bins_.begin(), bins_.begin() + p.cloud_limit,
+                         bins_.end(), stronger);
+        bins_.resize(p.cloud_limit);
+        std::sort(bins_.begin(), bins_.end());
+      }
+      out.cloud_bins.assign(bins_.begin(), bins_.end());
+    }
   }
 
 private:
@@ -158,24 +204,12 @@ inline Cloud empty_cloud(const std_msgs::msg::Header &header) {
 
 inline void append_points(Cloud &cloud, const Spoke &s,
                           const std::vector<int> &bins, const RangeAxis &axis,
-                          double offset, int limit, std::vector<int> &scratch) {
-  const auto *selected = &bins;
-  if (limit > 0 && bins.size() > static_cast<size_t>(limit)) {
-    scratch = bins;
-    const auto boundary = scratch.begin() + limit;
-    std::nth_element(
-        scratch.begin(), boundary, scratch.end(), [&](int a, int b) {
-          return s.data[a] == s.data[b] ? a < b : s.data[a] > s.data[b];
-        });
-    scratch.resize(limit);
-    std::sort(scratch.begin(), scratch.end());
-    selected = &scratch;
-  }
+                          double offset) {
   const double bearing = ros_bearing(s.azimuth_angle, offset);
   const double x = std::cos(bearing), y = std::sin(bearing);
   auto pos = cloud.data.size();
-  cloud.data.resize(pos + selected->size() * cloud.point_step);
-  for (const auto i : *selected) {
+  cloud.data.resize(pos + bins.size() * cloud.point_step);
+  for (const auto i : bins) {
     const double r = axis.metres(i);
     const std::array<float, 4> point = {static_cast<float>(r * x),
                                         static_cast<float>(r * y), 0,
@@ -183,7 +217,7 @@ inline void append_points(Cloud &cloud, const Spoke &s,
     std::memcpy(cloud.data.data() + pos, point.data(), cloud.point_step);
     pos += cloud.point_step;
   }
-  cloud.width += selected->size();
+  cloud.width += bins.size();
   cloud.row_step = cloud.data.size();
 }
 
@@ -206,8 +240,7 @@ public:
     scan.ranges.assign(count, std::numeric_limits<float>::quiet_NaN());
     scan.intensities.assign(count, 0);
   }
-  void add(const Spoke &s, const std::vector<int> &bins, const RangeAxis &axis,
-           bool nearest) {
+  void add(const Spoke &s, int best, const RangeAxis &axis, bool nearest) {
     const auto cell = scan_cell(s.azimuth_angle, start_, scan.ranges.size());
     if (!cell) {
       regular_ = false;
@@ -220,13 +253,8 @@ public:
     regular_ = regular_ && !observed_[i] &&
                std::abs(elapsed - i * dt_) <= std::max(1e-6, dt_ * 0.1);
     observed_[i] = true;
-    if (bins.empty())
+    if (best < 0)
       return;
-    const int best = nearest ? bins.front()
-                             : *std::max_element(bins.begin(), bins.end(),
-                                                 [&](int a, int b) {
-                                                   return s.data[a] < s.data[b];
-                                                 });
     const float distance = axis.metres(best);
     if (!std::isfinite(range) ||
         (nearest ? distance < range : s.data[best] > level)) {
@@ -234,8 +262,8 @@ public:
       level = s.data[best];
     }
   }
-  const Scan &finish() {
-    scan.time_increment = regular_ ? dt_ : 0;
+  const Scan &finish(bool has_row_times) {
+    scan.time_increment = regular_ && has_row_times ? dt_ : 0;
     return scan;
   }
 

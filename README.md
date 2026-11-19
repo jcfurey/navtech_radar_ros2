@@ -14,14 +14,15 @@ Live radar transport is still planned.
 
 This checkout contains all four ROS packages, including the legacy `nav_ross`
 interfaces. Start with a ROS 2 Lyrical installation, colcon, a C++17 compiler,
-and an initialized rosdep. Run the following in an empty workspace.
+and an initialized rosdep. These commands install libarchive and the test-only
+Rosbags oracle from Ubuntu packages. Run them in an empty workspace.
 
 ```bash
 source /opt/ros/lyrical/setup.bash
 mkdir -p src
 git clone --branch cpp https://github.com/jcfurey/navtech_radar_ros2.git src/navtech_radar_ros2
-sudo apt-get install python3-rosbags
-rosdep install --from-paths src --ignore-src --rosdistro lyrical -r -y
+sudo apt-get install libarchive-dev python3-rosbags
+rosdep install --from-paths src --ignore-src --skip-keys "libarchive-dev python3-rosbags-pip" --rosdistro lyrical -r -y
 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 source install/setup.bash
 colcon test --return-code-on-test-failure
@@ -36,6 +37,21 @@ and starts a radar-frame RViz profile when requested.
 ros2 launch navtech_radar_processing playback.launch.py bag:=/path/to/ros2_mcap rviz:=true
 ```
 
+The same launch accepts a bag recorded from the driver's two canonical topics.
+It rebuilds the sweeps, views, scans and clouds, including the last partial
+turn. Record TF alongside the radar when replay needs heading or deskew.
+
+```bash
+ros2 bag record -o radar_run --topics /navtech_radar/configuration /navtech_radar/fft/spoke /tf /tf_static
+ros2 launch navtech_radar_processing playback.launch.py bag:=radar_run
+```
+
+Start the recorder while the configuration publisher is present so it can
+capture the transient-local configuration. Replay uses reliable delivery for
+the two recorded topics and reads their original acquisition timestamps.
+A bag with one configuration and one spoke topic can use a namespace or
+remapped names. The launch identifies them by message type.
+
 Use `recording:=` for Navtech COLRAW, the Thames CPR with its decoded companion, vendor ROS 1 and ROS 2 sensor products, and the Oxford, RADIATE, Boreas, MulRan and MUSES radar datasets.
 
 ```bash
@@ -45,8 +61,7 @@ ros2 launch navtech_radar_processing playback.launch.py recording:=/path/to/radi
 For the input path and playback options for each collection, see the [recording playback guide](docs/recording-playback.md).
 
 Omit both `bag` and `recording` for an external TAMU player. Options include `cloud`, `scan`,
-`peak_selection`, `scan_selection`, `rate`, and `implementation:=python`
-for the reference nodes. `frame_id` sets the adapter radar frame and the RViz
+`peak_selection`, `scan_selection`, `rate`, and `detection_threads`. `frame_id` sets the adapter radar frame and the RViz
 fixed frame (default `navtech`). `robot_frame` and `heading_frame` enable the optional TF overlays
 when the corresponding transforms are available. Robot-specific mounting and
 the full TAMU viewer belong to the surrounding TAMU workspace.
@@ -77,14 +92,17 @@ topics without changing the source bag:
 /navtech_radar/scan          sensor_msgs/LaserScan (optional, lossy)
 ```
 
-The installed executables `legacy_bag_driver`, `fft_sweep_assembler` and
-`fft_sweep_visualizer` are C++. Each has a Python reference executable with the
-suffix `_py`. For TAMU bags, `implementation:=python` selects all three
-references. Both implementations accept the same ROS parameters and topic remaps.
+All installed radar executables are C++. The native recording reader decodes
+files, the ROS 2 player uses `rosbag2_transport`, and the road-cloud adapter
+converts the vendor export to metric XYZI. Python handles launch arguments and
+the test oracles in the source checkout.
 
-For faster playback, `implementation:=cpp_composed` loads the three C++ nodes
-into one three-thread ROS component container. It passes spokes and sweeps
-between the nodes in memory. External subscribers can read the same topics.
+The default `implementation:=cpp_composed` passes spokes and sweeps in memory.
+Each component has an isolated event-driven executor. The assembler detects
+peaks on independent rows using up to eight OpenMP threads, then builds the
+scan and cloud in encoder order. Dense CFAR stops selecting peaks once the cloud
+budget is full and the scan return is settled. Set `detection_threads:=1` for serial
+extraction or `implementation:=cpp` for separate C++ processes.
 
 ```bash
 ros2 launch navtech_radar_processing playback.launch.py implementation:=cpp_composed bag:=/path/to/ros2_mcap
@@ -179,6 +197,12 @@ to one wall-clock second or until the next cloud supersedes it. If coverage is
 still incomplete, it drops that cloud. Raw sweeps and scans continue during TF
 outages. A moving reflector can still change position during the revolution.
 
+Deskew also requires timing for individual rows. With RADIATE and MulRan
+polar PNGs, every row inherits the frame timestamp. When deskew is requested,
+the assembler skips that cloud and reports the timing limitation on
+`diagnostics`. Sweeps, images and scans continue. Leave `deskew_fixed_frame`
+empty to receive the measured planar cloud for those files.
+
 `peak_selection=threshold` preserves the original local-maxima threshold mode.
 The TAMU launch defaults to `cfar`: cell-averaging background estimation with
 16 training cells and 4 guard cells **per side**, an additive threshold offset
@@ -229,6 +253,11 @@ these with `radar_`. Set a suitable intensity floor and CFAR offset for other
 sample depths or recordings. Scan/cloud publishers use sensor-data QoS and
 publish empty/all-no-detection results to clear previous sweeps.
 
+Eight-bit spokes use `recorded_threshold_8bit` (24) and
+`recorded_cfar_offset_8bit` (12 FFT units) for both files and canonical
+spoke topics. Sixteen-bit spokes use `intensity_threshold` and
+`cfar_threshold_offset`.
+
 ## Runtime behavior
 
 Canonical topic defaults are relative (`navtech_radar/configuration`,
@@ -240,7 +269,8 @@ The two legacy input defaults remain absolute to match existing bags; override
 the input topic parameters or use ROS remapping for other sources.
 
 Configuration uses reliable, transient-local QoS, depth 1. Spokes use
-best-effort, volatile QoS with a configurable bounded queue. Sweep and image
+best-effort, volatile QoS. The assembler defaults to a 1,024-spoke input queue
+and the legacy adapter to a 512-message input queue. Sweep and image
 outputs use reliable, volatile QoS, depth 2; optional point clouds use the
 sensor-data profile. "Lossless" describes the sample representation, not a
 guarantee of packet delivery over best-effort DDS.
@@ -250,6 +280,16 @@ configuration geometry. A spoke before the first configuration has version 0.
 The legacy seconds/nanoseconds are preserved; the bag cannot recover original
 wire timestamp bytes. Diagnostic timers use steady time so they continue to
 report stale input while `/clock` is absent or paused.
+
+The assembler publishes a separate `sweep assembly` status on `diagnostics`
+once per wall-clock second. Its lifetime counters include received and
+rejected rows, missing nominal bearing cells across finalized turns, buffer
+overflows, time discontinuities, and rows discarded by those resets. An
+initial or final partial turn contributes missing cells. A completely absent
+turn cannot be counted from its bearings. Compare these counters with the
+adapter's spoke count and the exported products to locate loss during playback.
+`sweep_timing` describes the latest finalized turn and `deskew_skipped_timing`
+counts clouds skipped for insufficient timing.
 
 The assembler preserves the incoming frame. `output_frame` defaults to empty;
 if set, it requires that same input frame. It does not transform coordinates.
@@ -319,6 +359,12 @@ at startup.
 
 ## Performance and verification
 
+On a Ryzen Threadripper 3970X with Cyclone DDS, the installed C++ player replayed
+a dense 400 × 6,000 MCAP at 4 Hz and 16 Hz. In each run all six products arrived
+for all 96 turns, with all 38,401 spokes received and zero missing bearings.
+The [benchmark and reproduction command](docs/playback_validation.md#c-bag-player-through-all-six-outputs)
+include the integrity checks and timing method.
+
 On 32 full revolutions of the April 2024 TAMU recording, the C++ adapter and
 assembler together used 4.16 s of CPU versus 11.20 s for the Python nodes in
 one Release-build run. Both pipelines had subscribers for the raw sweep,
@@ -346,7 +392,7 @@ subscribed. It checks every raw row while the feeder continues at the requested
 rate. For the independent export check, add `--check-exports` to
 `compare_playback.py` on complete recorded turns. [Results and reproduction commands](docs/playback_validation.md#paced-load-and-export-accuracy)
 
-The registered tests also exercise both installed implementations with a small
+The registered tests also exercise the installed native executables and the source reference nodes with a small
 deterministic fixture. They run without a bag or radar hardware.
 
 ## SDK submodule

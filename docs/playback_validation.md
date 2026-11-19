@@ -56,8 +56,8 @@ optimization is not exercised by this point-cloud-disabled benchmark.
 ## SDK review
 
 The pinned IASDK commit is still `62759ba2f60bcef6e3787d889aba6b0773dde647`.
-Neither active Python node imports or links it, so playback fixes do not require
-changing the SDK gitlink or applying local SDK patches.
+The playback packages use the SDK as a protocol reference. They build independently
+of the vendor submodule.
 
 The C++ `FFT_data::timestamp_sec()` / `timestamp_nsec()` accessors and the
 recorded legacy messages use seconds and nanoseconds. The adapter should not
@@ -281,7 +281,7 @@ spanning 0.499 s. Both corrected assemblers emitted separate 201-row and
 300-row sweeps, with every retained FFT row matching its original spoke.
 
 From the driver checkout with its ROS workspace sourced, replay this case through
-the installed C++ and Python nodes. The check compares each sweep's row bytes,
+the installed C++ nodes and the source-checkout Python reference nodes. The check compares each sweep's row bytes,
 counters, encoders and timestamps against its retained input group. It also
 compares the two implementations' scan and cloud outputs.
 
@@ -349,6 +349,22 @@ same physical targets in every product, including the native clockwise bearing
 that appears to the right of the sensor on the plan view.
 [Export regression](../navtech_radar_processing/test/test_composed_exports.py)
 
+A follow-up Release run used the composed pipeline, Cyclone DDS, the dense
+400 × 6,000 fixture and 24 measured turns. Each run offered 9,601 spokes,
+including the closing wrap. Counts below exclude discovery traffic.
+
+| Offered turns/s | Adapter published | Assembler received | Missing bearing cells | Complete turns (all six outputs) |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 9,601 | 9,601 | 0 | 24/24 |
+| 16 | 9,601 | 6,207 | 3,394 | 2/24 |
+
+At 16 Hz every output topic still delivered 24 messages. The missing cells
+accounted for the difference between adapter publications and assembler
+callbacks. Both runs had zero rejected spokes and zero assembler buffer
+overflows. Each had one intentional time reset when the feeder rewound from
+the discovery probe to the measured interval. The stress tool prints these
+counter differences along with the independent image hash checks.
+
 On the 192 measured TAMU turns, the independent ROS consumer check matched
 153,883 cloud returns and 61,675 projected scan returns to their source FFT
 intensities and metric bins. Maximum horizontal residuals were 0.0000126 m
@@ -358,6 +374,24 @@ reference byte-for-byte on all 192 turns. The odometry turn again produced
 a +20.700° scene shift for −20.314° of vehicle yaw. These residuals in metres
 measure conversion arithmetic.
 Physical accuracy also depends on the sensor, timing and mounting calibration.
+
+### C++ bag player through all six outputs
+
+The Release build used the native MCAP player, an isolated executor for each composed stage, the default eight detector workers on the test host, and the default 1,024-spoke assembler queue. Each of the 96 measured turns had 400 spokes of 6,000 16-bit bins. The dense scene filled the 48-point cloud budget on every spoke. A separate ROS consumer checked both raw FFT hashes, all six topic stamps, scan dimensions and cloud counts.
+
+| Scheduled turns/s | Measured turns/s at all six outputs | Received spokes including closing wrap | Missing bearing cells | Complete turns |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 4.00 | 38,401 | 0 | 96/96 |
+| 16 | 16.07 | 38,401 | 0 | 96/96 |
+
+Both rows used the installed playback launch on localhost with Cyclone DDS. A second 16 Hz run with the native-player stress tool measured 16.03 turns/s and 94.9 MiB peak RSS for the component container. Every raw image matched, with zero rejected spokes and zero buffer resets. The measured frequency uses the interval between receipt of the last required product of the first and last complete turns. It excludes bag staging, discovery and shutdown.
+
+The original Python-paced benchmark on the same final build delivered all 96 turns at an offered 13.37 Hz when asked for 16 Hz. It remains useful for measuring time from an individual wrap publication to its last product. The native-player mode measures the complete C++ playback path and stages its temporary MCAP before timing.
+
+```bash
+export ROS_DOMAIN_ID=91 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+python3 tools/stress_playback.py --synthetic dense --rotations 96 --hz 16 --composed --native-player
+```
 
 ## Filtered point cloud validation
 
@@ -370,6 +404,12 @@ The native driver publishes an unordered `sensor_msgs/msg/PointCloud2` with four
 | TAMU route 1/run 2 (16-bit), CFAR | 32 | 25,874 | 0.0000049 m |
 
 A check against RADIATE's independently supplied Cartesian PNGs also tested horizontal orientation. At the projected locations of CFAR detections, the median per-frame correlation between point intensity and the published image pixel was 0.944 across all 18 frames. Reflecting the same points left-to-right gave −0.054. These checks establish how recorded returns are filtered and projected. Assessing obstacle precision and recall requires labelled targets, and absolute position accuracy depends on sensor and mounting calibration. [RADIATE sample](https://github.com/marcelsheeny/radiate_sdk/tree/b1d5de559784b3aa57bea99b00c13d495d79e846/data/radiate/tiny_foggy)
+
+### Native recording replay
+
+The installed composed launch replayed all 18 RADIATE tiny-foggy polar rotations at recorded speed on localhost. A separate ROS consumer compared the source-depth rotations, timestamps and 16-bit raw images to the polar PNGs. Both annotated BGR8 views matched the reference renderer byte-for-byte across all 18 turns. The consumer independently selected all 235,584 CFAR cloud points from the recorded bins. The largest horizontal difference was 0.00000539 m. All 7,200 finite scan ranges and intensities matched their source rows and bins. Launching the authors' Cartesian directory separately reproduced the pixels and timestamps of all 18 original mono8 images. [RADIATE source sequence](https://github.com/marcelsheeny/radiate_sdk/tree/b1d5de559784b3aa57bea99b00c13d495d79e846/data/radiate/tiny_foggy)
+
+The automated native-reader tests subscribe over DDS for each supported file profile. Fixtures cover compressed COLRAW, CPR pairing, a lost encoder wrap, shuffled Oxford Offroad tar members, and ROS 1 bag chunks with uncompressed, BZ2 and LZ4 payloads. The road-cloud test checks both byte orders. The installed-package test checks the native executable format of each driver and processing program. [Recording regression tests](../navtech_radar_driver/test/test_native_recordings.py) · [Installed-package tests](../navtech_radar_processing/test/test_installed_pipelines.py)
 
 ### Navtech road exports
 

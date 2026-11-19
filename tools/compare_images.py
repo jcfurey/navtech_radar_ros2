@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Compare both installed visualizers on identical recorded sweeps (Linux)."""
+"""Compare native and reference visualizers on identical recorded sweeps (Linux)."""
 import argparse
 from contextlib import ExitStack
 from copy import deepcopy
-from pathlib import Path
 import subprocess
 import time
 from uuid import uuid4
 
-from ament_index_python.packages import get_package_prefix
 from navtech_radar_msgs.msg import FftSweep, RadarConfiguration
 import numpy as np
 import rclpy
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Image
 
-from compare_playback import cpu_seconds, recorded_input, stop
+from compare_playback import comparison_command, cpu_seconds, recorded_input, stop
 
 
 class ImageComparison:
@@ -31,9 +29,9 @@ class ImageComparison:
         self.outputs = {}
         self.views = views
         self.processes = {}
-        directory = Path(get_package_prefix('navtech_radar_processing')) / 'lib/navtech_radar_processing'
-        for impl, suffix in [('cpp', ''), ('python', '_py')]:
-            cmd = [str(directory / ('fft_sweep_visualizer' + suffix)), '--ros-args',
+        for impl in ('cpp', 'python'):
+            exe = comparison_command('navtech_radar_processing', 'fft_sweep_visualizer', impl == 'python')
+            cmd = [*exe, '--ros-args',
                    '-r', f'__ns:={ns}/{impl}', '-p', 'sweep_topic:=' + ns + '/sweep',
                    '-p', 'configuration_topic:=' + ns + '/configuration']
             for param in parameters:

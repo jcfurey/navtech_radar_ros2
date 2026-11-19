@@ -2,8 +2,9 @@
 """Compare the 2022 Navtech ROS 2 road cloud export with its original COLRAW capture."""
 import argparse
 from contextlib import closing
+import sys
 from pathlib import Path
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'navtech_radar_driver/test/reference'))
 from navtech_recording.formats import colraw_rotations
 from navtech_recording.road_cloud import is_road_cloud_export, normalize_road_cloud
 import numpy as np

@@ -15,6 +15,8 @@ import zlib
 import cv2
 import numpy as np
 
+from .boundary import counter_crossed_zero
+
 
 @dataclass
 class Geometry:
@@ -297,12 +299,22 @@ def colraw_rotations(path, cpr=None):
             data = np.frombuffer(payload, dtype=np.uint8 if kind == 30 else '<u2', offset=start)
             if len(data) != geometry.bins:
                 raise ValueError('FFT range-bin count disagrees with configuration')
-            if rows and (enc < rows[-1][2] - geometry.encoder/2 or data.dtype != rows[-1][-1].dtype):
-                yield rotation()
-                rows.clear()
+            sensor = sec*10**9 + nsec
+            if rows:
+                prev_sensor, prev_host, prev_enc, prev_counter, prev_data = rows[-1]
+                # Compare within one clock. Recorder time is useful for CPR and
+                # captures with an unset radar clock.
+                gap = (sensor - prev_sensor if sensor and prev_sensor else
+                       host - prev_host if host and prev_host else None)
+                if (enc < prev_enc - geometry.encoder/2 or data.dtype != prev_data.dtype
+                        or (gap is not None and mhz and gap * mhz >= 10**12)
+                        or counter_crossed_zero(prev_enc, enc, (counter - prev_counter) % 65536,
+                                                geometry.rows, geometry.encoder, mhz / 1000, gap)):
+                    yield rotation()
+                    rows.clear()
             if len(rows) >= 2048:
                 raise ValueError('COLRAW azimuth did not wrap within 2048 spokes')
-            rows.append((sec*10**9+nsec, host, enc, counter, data))
+            rows.append((sensor, host, enc, counter, data))
         if video is not None and next(video, None) is not None:
             raise ValueError('more CPR video records than converted FFTs')
     if rows:
